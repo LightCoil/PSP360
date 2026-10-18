@@ -67,6 +67,8 @@ void DumpRegisters(const core::CPUState& cpu) {
 } // namespace
 
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
     core::SetLogLevel(core::LogLevel::Info);
 
     std::printf("psp360Phoenix — хостовый раннер ядра эмуляции\n");

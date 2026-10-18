@@ -25,6 +25,38 @@ constexpr uint32_t PSP_STACK_TOP  = 0x08A00000u;
 // Специальное значение PC, означающее «процесс остановлен».
 constexpr uint32_t PC_HALTED = 0xFFFFFFFFu;
 
+// Коды исключений MIPS32 (Cause.ExcCode, биты 6..2).
+enum class ExcCode : uint32_t {
+    Int  = 0,   // прерывание
+    AdEL = 4,   // ошибка адреса при чтении
+    AdES = 5,   // ошибка адреса при записи
+    Sys  = 8,   // syscall
+    Bp   = 9,   // break
+    RI   = 10,  // недопустимая инструкция
+    Ov   = 12,  // арифметическое переполнение
+};
+
+// Номера регистров CP0, используемые моделью (Hitmen, MIPS32 Vol. III).
+enum Cp0Reg : uint32_t {
+    CP0_BADVADDR = 8,
+    CP0_COUNT    = 9,
+    CP0_COMPARE  = 11,
+    CP0_STATUS   = 12,
+    CP0_CAUSE    = 13,
+    CP0_EPC      = 14,
+    CP0_PRID     = 15,
+    CP0_CONFIG   = 16,
+    CP0_EBASE    = 25,
+};
+
+// Битовые позиции полей в регистрах CP0 (MIPS32 Vol. III).
+constexpr uint32_t CP0_STATUS_IE  = 0x00000001u;  // Interrupt Enable
+constexpr uint32_t CP0_STATUS_EXL = 0x00000002u;  // Exception Level
+constexpr uint32_t CP0_STATUS_ERL = 0x00000004u;  // Error Level
+constexpr uint32_t CP0_STATUS_IM  = 0x0000FF00u;  // Interrupt Mask, биты 15..8
+constexpr uint32_t CP0_CAUSE_EXC  = 0x0000007Cu;  // ExcCode, биты 6..2
+constexpr uint32_t CP0_CAUSE_BD   = 0x80000000u;  // Branch Delay
+
 class Memory;
 
 class CPUState {
@@ -39,13 +71,18 @@ public:
     float vpr[VFPU_REGS][VFPU_LANES];
 
     // ---- сопроцессор COP0 (управление состоянием) ----
+    //
+    // Отдельного регистра Interrupt Mask на Allegrex нет: маска прерываний
+    // IM[7:0] занимает биты 15..8 регистра Status. Поэтому она хранится
+    // именно там, а доступна через InterruptMask()/SetInterruptMask(),
+    // иначе гостевой код не смог бы включить прерывания.
     uint32_t cp0_Status;
     uint32_t cp0_Cause;
     uint32_t cp0_EPC;
-    uint32_t cp0_IM;      // Interrupt Mask
+    uint32_t cp0_EBase;   // CP0 25: база векторов исключений
     uint32_t cp0_PRid;
 
-    // ---- LL/SC (атомарность, критично для многопоточного кода PSP) ----
+    // LL/SC (атомарность, критично для многопоточного кода PSP)
     bool     llBit;
     uint32_t llAddr;
 
@@ -58,6 +95,10 @@ public:
 
     // ---- прерывания ----
     bool interruptPending;
+    // Возбуждено синхронное исключение, PC должен быть перенаправлен.
+    bool exceptionPending;
+    // Текущая инструкция находится в слоте задержки.
+    bool inDelaySlot;
 
     // ---- привязка к подсистеме памяти ----
     Memory* memory;
@@ -79,6 +120,32 @@ public:
     bool ShouldTakeInterrupt() const;
     // Возвращает вектор обработчика прерывания или 0, если прерывать нельзя.
     uint32_t TakeInterruptVector();
+
+    // ---- маска прерываний: поле IM в Status, биты 15..8 ----
+    uint32_t InterruptMask() const {
+        return (cp0_Status & CP0_STATUS_IM) >> 8;
+    }
+    void SetInterruptMask(uint32_t mask) {
+        cp0_Status = (cp0_Status & ~CP0_STATUS_IM) |
+                     ((mask & 0xFFu) << 8);
+    }
+
+    // ---- исключения ----
+    // epc — адрес для EPC. Если исключение возникло в слоте задержки,
+    // epc обязан указывать на инструкцию ветвления, а BD устанавливается.
+    void RaiseException(ExcCode code, uint32_t epc, bool inDelaySlot);
+    bool ExceptionPending() const { return exceptionPending; }
+    void ClearExceptionPending() { exceptionPending = false; }
+    uint32_t ExceptionVector(ExcCode code) const {
+        return (cp0_EBase + 0x100u) + (static_cast<uint32_t>(code) << 5);
+    }
+    uint32_t InterruptVector(int irq) const {
+        return (cp0_EBase + 0x100u) + (static_cast<uint32_t>(irq) << 5);
+    }
+
+    // Истинно, если инструкция по текущему pc находится в слоте задержки.
+    bool InDelaySlot() const { return inDelaySlot; }
+    void SetInDelaySlot(bool v) { inDelaySlot = v; }
 
     // ---- доступ с проверкой индекса ----
     // Регистр $0 на реальном оборудовании всегда читается как ноль,

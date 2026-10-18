@@ -51,23 +51,33 @@ bool Interpreter::ExecMemory(Decoded& d, StepResult& r) {
     // LWL/LWR — загрузка невыровненного слова. На PSP не используются
     // (операции выровнены), реализованы для полноты.
     case core::Op::LWL: {
+        // Семантика little-endian (Allegrex, Config.LEL).
+        // A = base+offset, W = A & ~3, n = A & 3, b[k] — k-й байт слова W.
+        //   LWL: rt[3-k] = b[k]  для k = 0..n
+        // SWL — обратная операция. Отображение byte k -> byte (3-k) есть
+        // перестановка байтов, а не сдвиг, поэтому выполняется поэлементно.
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
-        const uint32_t shift = (addr & 3u) * 8u;
+        const uint32_t base = addr & ~3u;
+        const uint32_t n    = addr & 3u;
         uint32_t value = cpu.Reg(d.rt);
-        const uint32_t loaded = mem_.Read32(addr & ~3u);
-        const uint32_t mask = (shift == 0) ? 0xFFFFFFFFu : ~(0xFFFFFFFFu << shift);
-        value = (value & mask) | (loaded << shift);
-        if (d.rt != 0) cpu.SetReg(d.rt,value);
+        for (uint32_t k = 0; k <= n; ++k) {
+            const uint32_t shift = 8u * (3u - k);
+            value = (value & ~(0xFFu << shift)) | (mem_.Read8(base + k) << shift);
+        }
+        if (d.rt != 0) cpu.SetReg(d.rt, value);
         return true;
     }
     case core::Op::LWR: {
+        // LWR: rt[k-n] = b[k]  для k = n..3
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
-        const uint32_t shift = (3u - (addr & 3u)) * 8u;
+        const uint32_t base = addr & ~3u;
+        const uint32_t n    = addr & 3u;
         uint32_t value = cpu.Reg(d.rt);
-        const uint32_t loaded = mem_.Read32(addr & ~3u);
-        const uint32_t mask = (shift == 0) ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> shift);
-        value = (value & mask) | (loaded >> shift);
-        if (d.rt != 0) cpu.SetReg(d.rt,value);
+        for (uint32_t k = n; k <= 3u; ++k) {
+            const uint32_t shift = 8u * (k - n);
+            value = (value & ~(0xFFu << shift)) | (mem_.Read8(base + k) << shift);
+        }
+        if (d.rt != 0) cpu.SetReg(d.rt, value);
         return true;
     }
 
@@ -90,23 +100,27 @@ bool Interpreter::ExecMemory(Decoded& d, StepResult& r) {
         return true;
     }
     case core::Op::SWL: {
+        // Обратная операция к LWL: b[k] = rt[3-k]  для k = 0..n
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
-        const uint32_t shift = (addr & 3u) * 8u;
         const uint32_t base = addr & ~3u;
-        uint32_t value = mem_.Read32(base);
-        const uint32_t mask = (shift == 0) ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> shift);
-        value = (value & mask) | (cpu.Reg(d.rt) >> shift);
-        mem_.Write32(base, value);
+        const uint32_t n    = addr & 3u;
+        const uint32_t src  = cpu.Reg(d.rt);
+        for (uint32_t k = 0; k <= n; ++k) {
+            const uint32_t shift = 8u * (3u - k);
+            mem_.Write8(base + k, static_cast<uint8_t>((src >> shift) & 0xFFu));
+        }
         return true;
     }
     case core::Op::SWR: {
+        // Обратная операция к LWR: b[k] = rt[k-n]  для k = n..3
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
-        const uint32_t shift = (3u - (addr & 3u)) * 8u;
         const uint32_t base = addr & ~3u;
-        uint32_t value = mem_.Read32(base);
-        const uint32_t mask = (shift == 0) ? 0xFFFFFFFFu : ~(0xFFFFFFFFu << shift);
-        value = (value & mask) | (cpu.Reg(d.rt) << shift);
-        mem_.Write32(base, value);
+        const uint32_t n    = addr & 3u;
+        const uint32_t src  = cpu.Reg(d.rt);
+        for (uint32_t k = n; k <= 3u; ++k) {
+            const uint32_t shift = 8u * (k - n);
+            mem_.Write8(base + k, static_cast<uint8_t>((src >> shift) & 0xFFu));
+        }
         return true;
     }
     case core::Op::PREF:

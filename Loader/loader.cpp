@@ -21,6 +21,19 @@ constexpr uint32_t kPbpVersion200     = 0x00020000u;
 constexpr int kPbpIndexDataPsp = 6;
 constexpr int kPbpIndexDataPsar = 7;
 
+// Смещение 0 означает «секции нет». Часть писателей PBP кладёт на место
+// отсутствующей секции 0xFFFFFFFF — по формату это тоже «секции нет»,
+// и такое значение нельзя использовать как границу буфера: попытка
+// assign() до него читает примерно 4 ГиБ за пределами файла.
+constexpr uint32_t kPbpAbsentOffset = 0xFFFFFFFFu;
+
+inline bool SectionAbsent(uint32_t off) {
+    return off == 0 || off == kPbpAbsentOffset;
+}
+inline bool SectionPresent(uint32_t off, size_t size) {
+    return !SectionAbsent(off) && off <= size;
+}
+
 // Индексы секций в массиве смещений PBP
 constexpr int kPbpIndexParamSfo = 0;
 
@@ -111,6 +124,9 @@ const char* StatusName(LoadStatus s) {
 LoadStatus ExtractFromPBP(const uint8_t* pbp, size_t size,
                           std::vector<uint8_t>& outELF,
                           uint32_t& outTitleID) {
+    outELF.clear();
+    outTitleID = 0;
+
     if (!pbp || size < kPbpHeaderMinSize) return LoadStatus::PbpTruncated;
 
     if (std::memcmp(pbp + kPbpMagicOffset, "\0PBP", 4) != 0)
@@ -120,39 +136,59 @@ LoadStatus ExtractFromPBP(const uint8_t* pbp, size_t size,
     if (version != kPbpVersion100 && version != kPbpVersion200)
         return LoadStatus::BadPbpVersion;
 
-    const uint32_t dataPspOffset = ReadLE32(pbp + kPbpOffsetsArray + kPbpIndexDataPsp * 4);
+    uint32_t offsets[8];
+    for (int i = 0; i < 8; ++i)
+        offsets[i] = ReadLE32(pbp + kPbpOffsetsArray + i * 4);
 
+    // Любое смещение, отличное от «секции нет», обязано указывать внутрь
+    // файла. Проверяем весь массив, а не только нужную секцию.
+    for (int i = 0; i < 8; ++i) {
+        if (SectionAbsent(offsets[i])) continue;
+        if (offsets[i] > size) return LoadStatus::OutOfBounds;
+    }
+
+    // ---- секция data.psp обязана присутствовать ----
+    const uint32_t dataPspOffset = offsets[kPbpIndexDataPsp];
+    if (SectionAbsent(dataPspOffset) || dataPspOffset >= size)
+        return LoadStatus::OutOfBounds;
+
+    // Исключительная граница секции data.psp.
+    uint32_t dataPspEnd;
     if (version == kPbpVersion100) {
         // Размер data.psp хранится в заголовке.
         const uint32_t dataPspSize = ReadLE32(pbp + kPbpDataPspSizeField);
         if (dataPspSize == 0) return LoadStatus::EmptyDataPsp;
-        if (dataPspOffset == 0 || dataPspOffset >= size)
-            return LoadStatus::OutOfBounds;
-        if (dataPspOffset + dataPspSize > size)
-            return LoadStatus::PbpTruncated;
-
-        outELF.assign(pbp + dataPspOffset, pbp + dataPspOffset + dataPspSize);
+        // Проверка без переполнения: size - dataPspOffset не уходит в 0.
+        if (dataPspSize > size - dataPspOffset) return LoadStatus::PbpTruncated;
+        dataPspEnd = dataPspOffset + dataPspSize;
     } else {
         // В версии 0x200 размер определяется по началу следующей секции.
+        // Учитываем только реально присутствующие секции; 0 и 0xFFFFFFFF
+        // трактуются как «секции нет».
         uint32_t nextOffset = 0;
+        bool found = false;
         for (int i = kPbpIndexDataPsp + 1; i < 8; ++i) {
-            const uint32_t off = ReadLE32(pbp + kPbpOffsetsArray + i * 4);
-            if (off != 0 && (nextOffset == 0 || off < nextOffset)) nextOffset = off;
+            const uint32_t off = offsets[i];
+            if (SectionAbsent(off)) continue;
+            if (!found || off < nextOffset) { nextOffset = off; found = true; }
         }
-        if (nextOffset == 0) return LoadStatus::PbpTruncated;
-        if (dataPspOffset == 0 || dataPspOffset >= size)
-            return LoadStatus::OutOfBounds;
-        if (dataPspOffset >= nextOffset) return LoadStatus::OutOfBounds;
-
-        outELF.assign(pbp + dataPspOffset, pbp + nextOffset);
+        // Следующая секция не может начинаться раньше data.psp.
+        if (found && nextOffset < dataPspOffset) return LoadStatus::OutOfBounds;
+        // Если следующей секции нет, data.psp доходит до конца файла.
+        dataPspEnd = found ? nextOffset : static_cast<uint32_t>(size);
     }
 
+    // Итоговая проверка границ: обе должны лежать внутри буфера,
+    // порядок — возрастающий.
+    if (dataPspEnd > size || dataPspEnd < dataPspOffset)
+        return LoadStatus::OutOfBounds;
+
+    outELF.assign(pbp + dataPspOffset, pbp + dataPspEnd);
     if (outELF.empty()) return LoadStatus::EmptyDataPsp;
 
     // TitleID из PARAM.SFO (не обязателен).
-    outTitleID = 0;
-    const uint32_t sfoOffset = ReadLE32(pbp + kPbpOffsetsArray + kPbpIndexParamSfo * 4);
-    if (sfoOffset != 0 && sfoOffset + 20 <= size) {
+    const uint32_t sfoOffset = offsets[kPbpIndexParamSfo];
+    if (SectionPresent(sfoOffset, size) && sfoOffset <= size - 20) {
         const uint32_t available = static_cast<uint32_t>(size - sfoOffset);
         const std::string title = ParseSfoTitleId(pbp + sfoOffset, available);
         if (!title.empty()) {
@@ -175,8 +211,6 @@ LoadStatus LoadELF(const uint8_t* data, size_t size, Image& out) {
     if (data[5] != kElfData2LSB) return LoadStatus::BadElfEndian;
 
     // Сохраняем образ — сегменты ссылаются на него по смещениям.
-    out.elf.assign(data, data + size);
-
     const uint16_t machine = ReadELF16(data + 18);
     if (machine != kEmMips) return LoadStatus::BadElfMachine;
 
@@ -188,14 +222,12 @@ LoadStatus LoadELF(const uint8_t* data, size_t size, Image& out) {
 
     if (phentsize != kPhdrSize) return LoadStatus::NoLoadableSegments;
     if (phoff == 0 || phnum == 0) return LoadStatus::NoLoadableSegments;
-    if (phoff + static_cast<size_t>(phnum) * phentsize > size)
+    if (phoff > size || static_cast<size_t>(phnum) * phentsize > size - phoff)
         return LoadStatus::OutOfBounds;
 
-    out.segments.clear();
-    out.entryPoints.clear();
-
+    std::vector<Segment> segments;
     for (uint16_t i = 0; i < phnum; ++i) {
-        const uint8_t* ph = data + phoff + i * phentsize;
+        const uint8_t* ph = data + phoff + static_cast<size_t>(i) * phentsize;
         const uint32_t pType = ReadELF32(ph + 0);
 
         if (pType != kPtLoad) continue;
@@ -207,13 +239,29 @@ LoadStatus LoadELF(const uint8_t* data, size_t size, Image& out) {
         seg.filesz = ReadELF32(ph + 16);
         seg.flags  = ReadELF32(ph + 24);
 
-        if (seg.offset + seg.filesz > size) return LoadStatus::OutOfBounds;
+        // Проверка offset + filesz без переполнения uint32.
+        if (seg.filesz > size) return LoadStatus::OutOfBounds;
+        if (seg.offset > size - seg.filesz) return LoadStatus::OutOfBounds;
+
+        // Сегмент в памяти должен целиком помещаться в адресное
+        // пространство, а memsz не может быть меньше файловой части.
+        if (seg.memsz < seg.filesz) return LoadStatus::OutOfBounds;
+        if (seg.memsz > 0xFFFFFFFFu - seg.vaddr) return LoadStatus::OutOfBounds;
 
         // Сегменты .bss (filesz == 0) тоже нужны — они обнуляются.
-        out.segments.push_back(seg);
+        segments.push_back(seg);
     }
 
-    if (out.segments.empty()) return LoadStatus::NoLoadableSegments;
+    if (segments.empty()) return LoadStatus::NoLoadableSegments;
+
+    // Сохраняем образ — сегменты ссылаются на него по смещениям.
+    // Если источник уже является out.elf, self-assign не выполняем:
+    // диапазон assign() пересекался бы с самим вектором.
+    if (out.elf.data() != data || out.elf.size() != size) {
+        out.elf.assign(data, data + size);
+    }
+    out.segments = std::move(segments);
+    out.entryPoints.clear();
 
     if (eType == kEtExec || eType == kEtDyn) {
         if (entry != 0) out.entryPoints.push_back(entry);

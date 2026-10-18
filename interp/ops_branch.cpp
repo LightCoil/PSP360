@@ -3,6 +3,12 @@
 // Механизм слота задержки: за счёт сдвига pc/nextPC в Interpreter::Step()
 // инструкция в слоте задержки всегда выполняется ПОСЛЕ инструкции ветвления
 // и ДО целевого адреса. Здесь мы лишь выставляем nextPC = цель.
+//
+// АДРЕС ВОЗВРАТА JAL/JALR берётся из адреса самой инструкции (d.pc + 8),
+// а НЕ из изменяемого cpu.nextPC. Именно это делает семантику одинаковой
+// для всех путей исполнения (Step, StepOne, Run): к моменту диспетчеризации
+// в Step() значение nextPC уже сдвинуто до PC+8, и вычисление от него
+// давало PC+12.
 #include "interpreter.h"
 
 namespace ppsspp {
@@ -20,10 +26,10 @@ bool Interpreter::ExecBranch(Decoded& d, StepResult& r) {
             r = StepResult::Jump;
             return true;
         case core::Funct::JALR: {
-            // Адрес возврата — инструкция после слота задержки.
-            const uint32_t link = cpu.nextPC + 4;
+            // Адрес возврата — инструкция после слота задержки: d.pc + 8.
+            const uint32_t link = d.pc + 8u;
             cpu.nextPC = cpu.Reg(d.rs);
-            if (d.rd != 0) cpu.SetReg(d.rd,link);
+            if (d.rd != 0) cpu.SetReg(d.rd, link);
             r = StepResult::Jump;
             return true;
         }
@@ -39,9 +45,10 @@ bool Interpreter::ExecBranch(Decoded& d, StepResult& r) {
         return true;
 
     case core::Op::JAL: {
-        const uint32_t link = cpu.nextPC + 4;
+        // Адрес возврата — инструкция после слота задержки: d.pc + 8.
+        const uint32_t link = d.pc + 8u;
         cpu.nextPC = d.target;
-        cpu.SetReg(31,link);
+        cpu.SetReg(31, link);
         r = StepResult::Jump;
         return true;
     }

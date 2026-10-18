@@ -11,18 +11,33 @@
 namespace ppsspp {
 namespace vfpu {
 
-// Саб-операции VFPU (поле fmt — биты 5..0 инструкции).
-enum VfpuFmt : uint8_t {
-    VFMT_VMOVE = 0x00,  // vD = vS
-    VFMT_VNEG  = 0x01,  // vD = -vS
-    VFMT_VABS  = 0x02,  // vD = |vS|
-    VFMT_VADD  = 0x03,  // vD = vS + vT
-    VFMT_VSUB  = 0x04,  // vD = vS - vT
-    VFMT_VMUL  = 0x06,  // vD = vS * vT
-    VFMT_VDIV  = 0x07,  // vD = vS / vT
-    VFMT_VMIN  = 0x08,
-    VFMT_VMAX  = 0x09,
-};
+// Операции VFPU. ВАЖНО: это НЕ поле fmt инструкции.
+//
+// Allegrex разносит VFPU по нескольким опкодам MIPS, и номер операции
+// выбирается под-индексом внутри опкода (PPSSPP, MIPSTables.cpp):
+//
+//   tableVFPU0[8]  opcode 0x18, индекс = биты 25..23
+//     0 = vadd,  1 = vsub,  2 = vsbn,  7 = vdiv
+//   tableVFPU1[8]  opcode 0x19, индекс = биты 25..23
+//     0 = vmul,  1 = vdot,  2 = vscl,  4 = vhdp, 5 = vcrs, 6 = vdet
+//   tableVFPU3[8]  opcode 0x1B, индекс = биты 25..23
+//     0 = vcmp,  2 = vmin,  3 = vmax,  5 = vscmp, 6 = vsge, 7 = vslt
+//   tableVFPU4[32] opcode 0x34 (при битах 25..21 == 0), индекс = биты 20..16
+//     0 = vmov,  1 = vabs,  2 = vneg,  3 = vidt,  4 = vsat0,
+//     5 = vsat1, 6 = vzero, 7 = vone, 16 = vrcp, 17 = vrsq,
+//     18 = vsin, 19 = vcos, 20 = vexp2, 21 = vlog2, 22 = vsqrt,
+//     23 = vasin, 24 = vnrcp, 26 = vnsin, 27 = vrexp2
+namespace VfpuFunc {
+constexpr uint8_t VADD  = 0x00;  // 0x18
+constexpr uint8_t VSUB  = 0x01;  // 0x18
+constexpr uint8_t VDIV  = 0x07;  // 0x18
+constexpr uint8_t VMUL  = 0x00;  // 0x19
+constexpr uint8_t VMIN  = 0x02;  // 0x1B
+constexpr uint8_t VMAX  = 0x03;  // 0x1B
+constexpr uint8_t VMOV  = 0x00;  // 0x34
+constexpr uint8_t VABS  = 0x01;  // 0x34
+constexpr uint8_t VNEG  = 0x02;  // 0x34
+} // namespace VfpuFunc
 
 // Операции, работающие сразу со всеми четырьмя lane (формат .s4).
 // В данной реализации поддерживается только работа с lane 0 (формат .s1),
@@ -34,7 +49,9 @@ public:
 
     // Счётчик неизвестных операций (диагностика полноты реализации).
     static uint64_t unsupportedCount();
-    static void ResetStats();
+    // Счётчик операций с размером вектора .p/.t/.q: они обрабатываются
+    // частично (только lane 0), и это должно быть видно, а не скрыто.
+    static uint64_t partialVectorCount();
 };
 
 } // namespace vfpu

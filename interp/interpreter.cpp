@@ -74,6 +74,14 @@ StepResult Interpreter::StepInstruction(uint32_t pc, uint32_t word) {
         case core::Op::COP0: case core::Op::COP1: case core::Op::COP2: case core::Op::COP3:
             handled = ExecCop(d, r);
             break;
+
+        // VFPU Allegrex: операции разнесены по нескольким опкодам MIPS.
+        case core::Op::VFPU_A:
+        case core::Op::VFPU_B:
+        case core::Op::VFPU_C:
+        case core::Op::VFPU_D:
+            handled = ExecVfpu(d, r);
+            break;
         default:
             handled = false;
             break;
@@ -100,6 +108,7 @@ StepResult Interpreter::Step() {
         if (vector != 0) {
             cpu_.pc     = vector;
             cpu_.nextPC = vector + 4;
+            cpu_.SetInDelaySlot(false);
             return StepResult::Normal;
         }
     }
@@ -119,6 +128,22 @@ StepResult Interpreter::Step() {
 
     StepResult r = StepInstruction(pc, word);
     ++cpu_.instructionsExecuted;
+
+    // Синхронное исключение: перенаправляем PC на вектор обработчика.
+    if (cpu_.ExceptionPending()) {
+        const uint32_t vector =
+            cpu_.ExceptionVector(static_cast<core::ExcCode>(
+                (cpu_.cp0_Cause & core::CP0_CAUSE_EXC) >> 2));
+        cpu_.ClearExceptionPending();
+        cpu_.pc     = vector;
+        cpu_.nextPC = vector + 4;
+        cpu_.SetInDelaySlot(false);
+        return StepResult::Exception;
+    }
+
+    // Инструкция по pc+4 окажется в слоте задержки, если текущая была
+    // инструкцией ветвления.
+    cpu_.SetInDelaySlot(r == StepResult::Branch || r == StepResult::Jump);
     return r;
 }
 

@@ -23,6 +23,7 @@ enum class StepResult : uint32_t {
     Halted,
     Unimplemented,
     BusError,
+    Exception,   // возбуждено синхронное исключение, PC перенаправлен
 };
 
 class Interpreter {
@@ -57,7 +58,10 @@ private:
     bool ExecBranch(core::Decoded& d, StepResult& r);
     bool ExecMemory(core::Decoded& d, StepResult& r);
     bool ExecCop(core::Decoded& d, StepResult& r);
+    bool ExecVfpu(core::Decoded& d, StepResult& r);
     bool ExecMultDiv(core::Decoded& d, StepResult& r);
+    // Регистрирует исключение арифметического переполнения.
+    void RaiseOverflow(const core::Decoded& d, int32_t a, int32_t b);
 
     void Trace(const core::Decoded& d, StepResult r);
 

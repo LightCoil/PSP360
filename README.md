@@ -45,7 +45,8 @@ ctest --test-dir build -C Release --output-on-failure
 psp360Phoenix/
   CMakeLists.txt
   core/           модель процессора, память, декодер, логгер, номера syscall
-    cpu_state.{h,cpp}   CPU Allegrex: GPR, HI/LO, VFPU vpr[128][4], COP0, LL/SC
+    cpu_state.{h,cpp}   CPU Allegrex: GPR, HI/LO, VFPU vpr[128][4],
+                        COP0 (Status, Cause, EPC, EBase), заготовка LL/SC
     memory.{h,cpp}      RAM/VRAM/Scratchpad с проверкой границ и big-endian
     decoder.{h,cpp}     декодирование MIPS32 + VFPU
     logger.{h,cpp}      журналирование без внешних зависимостей
@@ -57,13 +58,45 @@ psp360Phoenix/
     ops_shift.cpp       сдвиги, syscall, break
     ops_branch.cpp      beq/bne/blez/bgtz/j/jal/jr/jalr + slot задержки
     ops_mem.cpp         lb/lh/lw/lbu/lhu/sb/sh/sw (+ lwl/lwr/swl/swr)
-    ops_cop.cpp         COP0 (mfc0/mtc0), COP2 -> VFPU
+    ops_cop.cpp         COP0 (mfc0/mtc0)
   vfpu/           обработчик VFPU (mov/neg/abs/add/sub/mul/div/min/max)
   Loader/         PBP -> ELF -> загрузка сегментов в память
-  tests/          58 тестов GoogleTest
+  tests/          129 тестов GoogleTest
   host/main.cpp   хостовый раннер
   xbox360/        скрипты целевой сборки (требуют devkitXenon)
+  docs/ARCHITECTURE_NOTES.md  проверенные раскладки Allegrex и MIPS32
+                              с указанием первоисточников
 ```
+
+## Архитектурные решения
+
+**Проверенные раскладки.** Всё, что касается раскладки полей, взято из
+первоисточников, а не восстановлено по памяти: PSP CPU Overview (Hitmen)
+и исходники PPSSPP. Выводы и ссылки — в `docs/ARCHITECTURE_NOTES.md`.
+
+**Порядок байтов — little-endian.** Allegrex работает в LE-режиме
+(Config.LEL), ELF-образы PSP — MIPSEL. Сборка приведением указателя к
+`uint16_t*`/`uint32_t*` намеренно не используется: она зависит от платформы,
+а код должен собираться и для MSVC-хоста, и для PowerPC-хоста Xbox 360.
+
+**VFPU.** В отличие от обычного сопроцессора, VFPU на Allegrex разнесён по
+нескольким опкодам MIPS: `0x18` (vadd/vsub/vdiv), `0x19` (vmul), `0x1B`
+(vmin/vmax), `0x34` (vmov/vabs/vneg). COP2 (`0x12`) — это перенос регистров
+(lv.s, sv.s, mftv), а не векторные операции. Поля регистров семибитные:
+приёмник — биты 6..0, источник 1 — 14..8, источник 2 — 22..16; биты 15 и 7
+несут размер вектора (.s/.p/.t/.q) и в поля регистров не входят.
+
+**Маска прерываний.** Отдельного регистра Interrupt Mask на Allegrex нет:
+IM[7:0] занимает биты 15..8 регистра Status. Хранить её отдельным полем
+нельзя — тогда гостевой код не смог бы включить прерывания.
+
+**Адрес возврата JAL/JALR** определяется адресом самой инструкции
+(`d.pc + 8`), а не изменяемым `cpu.nextPC`. Иначе `Step()` и `StepOne()`
+давали бы разные значения.
+
+**Исключения.** Переполнение `ADD`/`SUB`/`ADDI` возбуждает исключение
+Arithmetic Overflow (ExcCode 12) с записью EPC и BD, а не останавливает
+эмулятор. `ADDU`/`ADDIU`/`SUBU` исключения не возбуждают по определению.
 
 ## Архитектурные решения
 
@@ -71,17 +104,38 @@ psp360Phoenix/
 даёт прямой доступ к `vpr[128][4]` без геттеров. Позднейшая версия проекта
 перевела их в private и потеряла векторные регистры — из-за чего обработчик
 VFPU перестал компилироваться. Здесь сохранены оба пути: прямой доступ к полям
-и безопасные `Reg()` / `SetReg()`, которые additionally учитывают, что `$0`
-всегда читается как ноль.
+и безопасные `Reg()` / `SetReg()`, которые учитывают, что `$0` всегда
+читается как ноль.
 
 **Модель pc/nextPC.** Слот задержки MIPS реализован сдвигом `pc`/`nextPC` в
 `Interpreter::Step()` **до** диспетчеризации. Инструкция ветвления лишь
 выставляет `nextPC = цель`, поэтому инструкция в слоте задержки всегда
 выполняется между ней и целью — автоматически, без отдельного флага.
+Признак нахождения в слоте задержки хранится в `CPUState::inDelaySlot` и
+нужен для корректного EPC при исключении (BD = 1, EPC указывает на ветвление).
 
 **Память.** Реальное выделение (`calloc`), три отображаемые области с
-проверкой принадлежности и границ, big-endian как на PSP. В предыдущих
+проверкой принадлежности и границ, little-endian как на PSP. В предыдущих
 версиях указатели просто присваивались фиктивным адресам `0xEC000000`.
+
+## Проверка
+
+```powershell
+# Полная пересборка с нуля
+cmake -S . -B build -G "Visual Studio 17 2022"
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+
+# Под AddressSanitizer
+cmake -S . -B build-asan -G "Visual Studio 17 2022" `
+      -DCMAKE_CXX_FLAGS="/fsanitize=address /Zi /INCREMENTAL:NO" `
+      -DCMAKE_EXE_LINKER_FLAGS="/INCREMENTAL:NO"
+cmake --build build-asan --config Release
+.\build-asan\Release\psp360_tests.exe
+```
+
+Sanitizer-прогон: 129 тестов и отдельный набор из ~12 000 граничных случаев
+загрузчика и памяти — без диагностик ASan.
 
 ## Состояние тулчейна (проверено 18.10.2026)
 

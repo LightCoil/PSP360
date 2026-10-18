@@ -26,7 +26,7 @@ void CPUState::Reset(uint32_t newPC) {
     cp0_Status = 0;
     cp0_Cause  = 0;
     cp0_EPC    = 0;
-    cp0_IM     = 0;
+    cp0_EBase  = 0;
     cp0_PRid   = 0;
 
     llBit = false;
@@ -36,6 +36,8 @@ void CPUState::Reset(uint32_t newPC) {
     scratchPC = newPC;
 
     interruptPending = false;
+    exceptionPending = false;
+    inDelaySlot = false;
     instructionsExecuted = 0;
 }
 
@@ -60,33 +62,50 @@ void CPUState::ClearInterrupt(int irq) {
 }
 
 bool CPUState::ShouldTakeInterrupt() const {
-    const bool IE  = (cp0_Status & 1u) != 0;  // Interrupt Enable
-    const bool EXL = (cp0_Status & 2u) != 0;  // Exception Level
-    const bool ERL = (cp0_Status & 4u) != 0;  // Error Level
+    const bool IE  = (cp0_Status & CP0_STATUS_IE) != 0;
+    const bool EXL = (cp0_Status & CP0_STATUS_EXL) != 0;
+    const bool ERL = (cp0_Status & CP0_STATUS_ERL) != 0;
 
     if (!IE || EXL || ERL) return false;
 
     const uint32_t pending = (cp0_Cause & 0x0000FF00u) >> 8;
-    return (pending & cp0_IM) != 0;
+    return (pending & InterruptMask()) != 0;
 }
 
 uint32_t CPUState::TakeInterruptVector() {
     if (!ShouldTakeInterrupt()) return 0;
 
     const uint32_t pending = (cp0_Cause & 0x0000FF00u) >> 8;
-    uint32_t irq = 0;
+    const uint32_t masked  = pending & InterruptMask();
+    int irq = 0;
     for (int i = 0; i < 8; ++i) {
-        if (pending & (1u << i)) { irq = static_cast<uint32_t>(i); break; }
+        if (masked & (1u << i)) { irq = i; break; }
     }
 
-    // Стандартная последовательность входа в обработчик прерывания MIPS:
+    // Стандартная последовательность входа MIPS: записываем EPC,
     // устанавливаем EXL и сбрасываем IE.
     cp0_EPC    = pc;
-    cp0_Status = (cp0_Status | 0x00000002u) & ~0x00000001u;
+    cp0_Status = (cp0_Status | CP0_STATUS_EXL) & ~CP0_STATUS_IE;
+    // Прерывание не помечается как находящееся в слоте задержки.
+    cp0_Cause &= ~CP0_CAUSE_BD;
 
-    // Базовый вектор прерывания PSP
-    constexpr uint32_t kBaseVector = 0x00000100u;
-    return kBaseVector + irq * 0x20u;
+    return InterruptVector(irq);
+}
+
+// ---------------------------------------------------------------- исключения
+
+void CPUState::RaiseException(ExcCode code, uint32_t epc, bool delaySlot) {
+    cp0_EPC = epc;
+
+    // ExcCode занимает биты 6..2, BD — бит 31.
+    cp0_Cause = (cp0_Cause & ~(CP0_CAUSE_EXC | CP0_CAUSE_BD)) |
+                (static_cast<uint32_t>(code) << 2) |
+                (delaySlot ? CP0_CAUSE_BD : 0u);
+
+    cp0_Status |=  CP0_STATUS_EXL;   // EXL = 1
+    cp0_Status &= ~CP0_STATUS_IE;    // IE  = 0
+
+    exceptionPending = true;
 }
 
 } // namespace core

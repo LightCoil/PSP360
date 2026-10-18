@@ -11,6 +11,8 @@ using ppsspp::core::Memory;
 using ppsspp::core::CPUState;
 using ppsspp::interp::Interpreter;
 using ppsspp::interp::StepResult;
+namespace core = ppsspp::core;
+namespace interp = ppsspp::interp;
 
 // ---- кодировщики инструкций ----
 static inline uint32_t encR(uint32_t rs, uint32_t rt, uint32_t rd,
@@ -174,16 +176,46 @@ TEST_F(InterpTest, LoadStoreByteAndHalf) {
     cpu.gpr[2] = 0x80u;
     one(encI(0x28, 1, 2, 0));          // sb $2,0($1)
     one(encI(0x21, 1, 3, 0));          // lh $3,0($1)
-    // PSP — big-endian: по адресу лежит 0x80 0x00 => halfword 0x8000 => -32768
-    EXPECT_EQ(cpu.gpr[3], 0xFFFF8000u);
+    // PSP little-endian: по адресу 80 00 => halfword 0x0080 = +128.
+    EXPECT_EQ(cpu.gpr[3], 128u);
 
     one(encI(0x25, 1, 4, 0));          // lhu $4,0($1) -> беззнаковое
-    EXPECT_EQ(cpu.gpr[4], 0x8000u);
+    EXPECT_EQ(cpu.gpr[4], 128u);
 
     cpu.gpr[5] = 0x1234u;
     one(encI(0x29, 1, 5, 2));          // sh $5,2($1)
     one(encI(0x25, 1, 6, 2));          // lhu $6,2($1)
     EXPECT_EQ(cpu.gpr[6], 0x1234u);
+}
+
+// Знаковое расширение halfword в little-endian памяти.
+TEST_F(InterpTest, LoadHalfwordSignExtension) {
+    cpu.gpr[1] = 0x08802140u;
+    // sw $2 -> 0xFFFFFFFF, затем lh читает младшие два байта: FF FF -> -1
+    cpu.gpr[2] = 0xFFFFFFFFu;
+    one(encI(0x2B, 1, 2, 0));
+    one(encI(0x21, 1, 3, 0));
+    EXPECT_EQ(cpu.gpr[3], 0xFFFFFFFFu);
+
+    // lw того же слова
+    one(encI(0x23, 1, 4, 0));
+    EXPECT_EQ(cpu.gpr[4], 0xFFFFFFFFu);
+}
+
+// Загрузка байта с расширением знака: 0x80 -> -128, 0x7F -> 127.
+TEST_F(InterpTest, LoadByteSignExtension) {
+    cpu.gpr[1] = 0x08802180u;
+    mem.Write8(0x08802180u, 0x80u);
+    mem.Write8(0x08802181u, 0x7Fu);
+
+    one(encI(0x20, 1, 2, 0));          // lb $2,0($1) -> -128
+    EXPECT_EQ(cpu.gpr[2], 0xFFFFFF80u);
+
+    one(encI(0x20, 1, 3, 1));          // lb $3,1($1) -> 127
+    EXPECT_EQ(cpu.gpr[3], 127u);
+
+    one(encI(0x24, 1, 4, 0));          // lbu $4,0($1) -> 128
+    EXPECT_EQ(cpu.gpr[4], 128u);
 }
 
 TEST_F(InterpTest, NegativeOffsetLoad) {
@@ -294,6 +326,234 @@ TEST_F(InterpTest, RunCountersAndHalt) {
     EXPECT_EQ(executed, 5u);
     EXPECT_EQ(cpu.instructionsExecuted, 5u);
     EXPECT_EQ(cpu.pc, start + 20u);
+}
+
+// =========================================================================
+// РЕГРЕССИЯ: адрес возврата JAL / JALR
+//
+// Адрес возврата определяется адресом самой инструкции: PC + 8
+// (инструкция после слота задержки). Раньше он вычислялся из изменяемого
+// cpu.nextPC, который к моменту диспетчеризации в Step() уже равен PC+8,
+// из-за чего получалось PC+12. Пути Step() и StepOne() давали разные
+// значения. Здесь проверяется согласованность всех путей исполнения.
+// =========================================================================
+
+static uint32_t encJalr(uint32_t rs, uint32_t rd) { return encR(rs, 0, rd, 0, 0x09); }
+static uint32_t encJr(uint32_t rs) { return encR(rs, 0, 0, 0, 0x08); }
+
+// --- одиночный шаг через Step() ---
+
+TEST_F(InterpTest, JalLinkViaStep) {
+    const uint32_t target = 0x08805000u;
+    mem.Write32(kTestPC, encJ(0x03, target));          // jal target
+    mem.Write32(kTestPC + 4, encI(0x09, 0, 0, 0));     // слот задержки: nop
+    mem.Write32(target, encI(0x09, 0, 0, 0));
+
+    cpu.Reset(kTestPC);
+    interp.Step();
+
+    EXPECT_EQ(cpu.gpr[31], kTestPC + 8u)
+        << "JAL через Step(): адрес возврата обязан быть PC+8";
+    EXPECT_EQ(cpu.nextPC, target);
+}
+
+TEST_F(InterpTest, JalrLinkViaStep) {
+    const uint32_t target = 0x08805100u;
+    mem.Write32(kTestPC, encJalr(5, 31));              // jalr $31, $5
+    mem.Write32(kTestPC + 4, encI(0x09, 0, 0, 0));
+    mem.Write32(target, encI(0x09, 0, 0, 0));
+
+    cpu.Reset(kTestPC);
+    cpu.gpr[5] = target;
+    interp.Step();
+
+    EXPECT_EQ(cpu.gpr[31], kTestPC + 8u)
+        << "JALR через Step(): адрес возврата обязан быть PC+8";
+    EXPECT_EQ(cpu.nextPC, target);
+}
+
+// --- одиночный шаг через StepOne() ---
+
+TEST_F(InterpTest, JalLinkViaStepOne) {
+    const uint32_t target = 0x08805200u;
+    const uint32_t next = interp.StepOne(kTestPC, encJ(0x03, target));
+    EXPECT_EQ(cpu.gpr[31], kTestPC + 8u);
+    EXPECT_EQ(next, target);
+}
+
+TEST_F(InterpTest, JalrLinkViaStepOne) {
+    const uint32_t target = 0x08805300u;
+    cpu.gpr[5] = target;
+    const uint32_t next = interp.StepOne(kTestPC, encJalr(5, 31));
+    EXPECT_EQ(cpu.gpr[31], kTestPC + 8u);
+    EXPECT_EQ(next, target);
+}
+
+// --- прогон через Run() ---
+
+TEST_F(InterpTest, JalLinkViaRun) {
+    const uint32_t start  = 0x08805400u;
+    const uint32_t target = 0x08805500u;
+
+    mem.Write32(start, encJ(0x03, target));           // jal
+    mem.Write32(start + 4, encI(0x09, 0, 8, 0x11));   // слот задержки
+    mem.Write32(target, encI(0x09, 0, 9, 0x22));
+
+    cpu.Reset(start);
+    interp.Run(3);
+
+    EXPECT_EQ(cpu.gpr[31], start + 8u);
+    EXPECT_EQ(cpu.gpr[8], 0x11u);    // слот задержки выполнен
+    EXPECT_EQ(cpu.gpr[9], 0x22u);    // цель достигнута
+}
+
+TEST_F(InterpTest, JalrLinkViaRun) {
+    const uint32_t start  = 0x08805600u;
+    const uint32_t target = 0x08805700u;
+
+    mem.Write32(start, encJalr(5, 31));
+    mem.Write32(start + 4, encI(0x09, 0, 8, 0x33));
+    mem.Write32(target, encI(0x09, 0, 9, 0x44));
+
+    cpu.Reset(start);
+    cpu.gpr[5] = target;
+    interp.Run(3);
+
+    EXPECT_EQ(cpu.gpr[31], start + 8u);
+    EXPECT_EQ(cpu.gpr[8], 0x33u);
+    EXPECT_EQ(cpu.gpr[9], 0x44u);
+}
+
+// --- вызов и возврат: jal ... jr $ra ---
+
+TEST_F(InterpTest, CallAndReturnThroughJrRa) {
+    //   main:   jal    sub
+    //           addiu  $4, $0, 7      <- должно выполниться после возврата
+    //   sub:    addiu  $3, $0, 99
+    //           jr     $31
+    //           nop
+    const uint32_t main_ = 0x08805800u;
+    const uint32_t sub_  = 0x08805900u;
+
+    mem.Write32(main_, encJ(0x03, sub_));
+    mem.Write32(main_ + 4, encI(0x09, 0, 0, 0));           // слот задержки jal
+    mem.Write32(main_ + 8, encI(0x09, 0, 4, 7));           // выполнится после ret
+
+    mem.Write32(sub_, encI(0x09, 0, 3, 99));
+    mem.Write32(sub_ + 4, encJr(31));
+    mem.Write32(sub_ + 8, encI(0x09, 0, 0, 0));            // слот задержки jr
+
+    cpu.Reset(main_);
+    // 3 инструкции main (jal, слот) + 2 подпрограммы (addiu, jr) + 1 слот jr
+    // + 1 инструкция после возврата
+    interp.Run(6);
+
+    EXPECT_EQ(cpu.gpr[3], 99u);   // подпрограмма выполнилась
+    EXPECT_EQ(cpu.gpr[4], 7u);    // выполнение продолжилось после возврата
+}
+
+// --- регистр назначения JALR ---
+
+TEST_F(InterpTest, JalrUsesRdAsLinkRegister) {
+    const uint32_t target = 0x08805A00u;
+    mem.Write32(kTestPC, encJalr(5, 6));   // jalr $6, $5
+    mem.Write32(kTestPC + 4, encI(0x09, 0, 0, 0));
+
+    cpu.Reset(kTestPC);
+    cpu.gpr[5] = target;
+    interp.Step();
+
+    EXPECT_EQ(cpu.gpr[6], kTestPC + 8u);
+    EXPECT_EQ(cpu.gpr[31], 0u) << "JALR не должен трогать $ra, если rd = 6";
+}
+
+TEST_F(InterpTest, JalrWithRdZeroDoesNotWriteLink) {
+    const uint32_t target = 0x08805B00u;
+    mem.Write32(kTestPC, encJalr(5, 0));    // jalr $0, $5
+    mem.Write32(kTestPC + 4, encI(0x09, 0, 0, 0));
+
+    cpu.Reset(kTestPC);
+    cpu.gpr[5] = target;
+    cpu.gpr[31] = 0xDEADBEEFu;
+    interp.Step();
+
+    EXPECT_EQ(cpu.gpr[31], 0xDEADBEEFu) << "jalr $0,$5 не должен писать $ra";
+}
+
+// --- согласованность всех путей ---
+
+TEST_F(InterpTest, AllExecutionPathsAgreeOnJalLink) {
+    const uint32_t target = 0x08805C00u;
+    const uint32_t word   = encJ(0x03, target);
+
+    uint32_t viaStepOne = 0;
+    {
+        core::CPUState c; c.Reset(kTestPC);
+        interp::Interpreter i(c, mem);
+        i.StepOne(kTestPC, word);
+        viaStepOne = c.gpr[31];
+    }
+    uint32_t viaStep = 0;
+    {
+        core::CPUState c; c.Reset(kTestPC);
+        interp::Interpreter i(c, mem);
+        mem.Write32(kTestPC, word);
+        i.Step();
+        viaStep = c.gpr[31];
+    }
+    uint32_t viaRun = 0;
+    {
+        core::CPUState c; c.Reset(kTestPC);
+        interp::Interpreter i(c, mem);
+        mem.Write32(kTestPC, word);
+        mem.Write32(kTestPC + 4, encI(0x09, 0, 0, 0));
+        mem.Write32(target, encI(0x09, 0, 0, 0));
+        i.Run(1);
+        viaRun = c.gpr[31];
+    }
+
+    EXPECT_EQ(viaStepOne, kTestPC + 8u);
+    EXPECT_EQ(viaStep, viaStepOne) << "Step() и StepOne() расходятся";
+    EXPECT_EQ(viaRun, viaStepOne)   << "Run() и StepOne() расходятся";
+}
+
+// --- слот задержки ---
+
+TEST_F(InterpTest, DelaySlotExecutesForJalBeforeTarget) {
+    const uint32_t start  = 0x08805D00u;
+    const uint32_t target = 0x08805E00u;
+
+    mem.Write32(start, encJ(0x03, target));
+    mem.Write32(start + 4, encI(0x09, 0, 5, 0x77));   // слот задержки
+    mem.Write32(start + 8, encI(0x09, 0, 6, 0x88));   // не выполняется
+    mem.Write32(target, encI(0x09, 0, 7, 0x99));
+
+    cpu.Reset(start);
+    interp.Run(3);
+
+    EXPECT_EQ(cpu.gpr[5], 0x77u) << "слот задержки JAL не выполнен";
+    EXPECT_EQ(cpu.gpr[6], 0u)   << "инструкция после слота выполнена";
+    EXPECT_EQ(cpu.gpr[7], 0x99u);
+    EXPECT_EQ(cpu.pc, target + 4u);
+}
+
+TEST_F(InterpTest, DelaySlotExecutesForJalrBeforeTarget) {
+    const uint32_t start  = 0x08805F00u;
+    const uint32_t target = 0x08806000u;
+
+    mem.Write32(start, encJalr(5, 31));
+    mem.Write32(start + 4, encI(0x09, 0, 6, 0x77));
+    mem.Write32(start + 8, encI(0x09, 0, 7, 0x88));   // не выполняется
+    mem.Write32(target, encI(0x09, 0, 8, 0x99));
+
+    cpu.Reset(start);
+    cpu.gpr[5] = target;
+    interp.Run(3);
+
+    EXPECT_EQ(cpu.gpr[6], 0x77u);
+    EXPECT_EQ(cpu.gpr[7], 0u);
+    EXPECT_EQ(cpu.gpr[8], 0x99u);
+    EXPECT_EQ(cpu.pc, target + 4u);
 }
 
 } // namespace

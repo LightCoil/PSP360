@@ -29,6 +29,14 @@ void putBytes(std::vector<uint8_t>& v, const void* p, size_t n) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
     v.insert(v.end(), b, b + n);
 }
+// Перезаписывает 4 байта little-endian по заданному смещению.
+void patchLE32(std::vector<uint8_t>& v, size_t off, uint32_t x) {
+    ASSERT_LE(off + 4, v.size());
+    v[off + 0] = static_cast<uint8_t>(x);
+    v[off + 1] = static_cast<uint8_t>(x >> 8);
+    v[off + 2] = static_cast<uint8_t>(x >> 16);
+    v[off + 3] = static_cast<uint8_t>(x >> 24);
+}
 
 // ---- сборка минимального ELF ----
 std::vector<uint8_t> MakeElf(uint32_t entry, uint32_t textAddr,
@@ -120,6 +128,21 @@ std::vector<uint8_t> MakePBP(const std::vector<uint8_t>& elf, uint32_t version) 
     return p;
 }
 
+// PBP v0x200 с произвольным содержимым поля data.psar в offsets[7].
+// Нужен, чтобы воспроизвести обработку «отсутствующей» секции.
+std::vector<uint8_t> MakePBPv200WithPsar(const std::vector<uint8_t>& elf,
+                                         uint32_t psarOffsetField) {
+    std::vector<uint8_t> p;
+    putBytes(p, "\0PBP", 4);
+    putLE32(p, 0x00020000u);
+    const uint32_t offsets[8] = {0, 0, 0, 0, 0, 0, 0x30u, psarOffsetField};
+    for (int i = 0; i < 8; ++i) putLE32(p, offsets[i]);
+    putLE32(p, static_cast<uint32_t>(elf.size()));   // data.psp size @ 0x28
+    putLE32(p, 0);                                  // data.psar size @ 0x2C
+    p.insert(p.end(), elf.begin(), elf.end());
+    return p;
+}
+
 class LoaderTest : public ::testing::Test {
 protected:
     std::vector<uint8_t> code;
@@ -128,9 +151,11 @@ protected:
 
     LoaderTest() {
         mem.Init();
-        // addiu $2,$0,42 ; addiu $3,$0,24
-        code.push_back(0x24); code.push_back(0x02); code.push_back(0x00); code.push_back(0x2A);
-        code.push_back(0x24); code.push_back(0x03); code.push_back(0x00); code.push_back(0x18);
+        // addiu $2,$0,42 (0x2402002A) ; addiu $3,$0,24 (0x24030018).
+        // ELF-образ PSP — MIPSEL, поэтому в файле младший байт первым:
+        // 2A 00 02 24 и 18 00 03 24.
+        code.push_back(0x2A); code.push_back(0x00); code.push_back(0x02); code.push_back(0x24);
+        code.push_back(0x18); code.push_back(0x00); code.push_back(0x03); code.push_back(0x24);
         elf = MakeElf(0x08804000u, 0x08804000u, code);
     }
     void TearDown() override { mem.Shutdown(); }
@@ -223,6 +248,194 @@ TEST_F(LoaderTest, LoadIntoMemoryAndExecute) {
 
     EXPECT_EQ(cpu.gpr[2], 42u);
     EXPECT_EQ(cpu.gpr[3], 24u);
+}
+
+// =========================================================================
+// РЕГРЕССИЯ: границы секций PBP
+//
+// Старый код брал offsets[7] (data.psar) как верхнюю границу data.psp,
+// пропуская значение 0xFFFFFFFF, которым часть писателей PBP помечает
+// отсутствующую секцию. Итог — чтение примерно 4 ГиБ за пределами буфера:
+// access violation на файле размером 140 байт.
+// =========================================================================
+
+TEST_F(LoaderTest, PbpV200WithPsarOffsetAllOnesIsTreatedAsAbsent) {
+    // 0xFFFFFFFF — штатная метка «секции нет», а не граница буфера.
+    // Старый код принимал её как nextOffset и читал ~4 ГиБ (access violation).
+    // Теперь data.psp должен просто дойти до конца файла.
+    const std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0xFFFFFFFFu);
+
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+
+    ASSERT_EQ(st, LoadStatus::Ok) << StatusName(st);
+    // Размер ограничен реальным файлом, а не 0xFFFFFFFF.
+    EXPECT_EQ(img.elf.size(), pbp.size() - 0x30u);
+    EXPECT_TRUE(img.IsValid());
+}
+
+// Смещение, которое не является «отсутствующей секцией», но уходит за
+// конец файла, — это повреждение, а не «секции нет».
+TEST_F(LoaderTest, RejectsPbpV200WithPsarOffsetPastEndOfFile) {
+    const std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0x7FFFFFFFu);
+    Image img;
+    EXPECT_EQ(LoadPBPFromMemory(pbp.data(), pbp.size(), img),
+              LoadStatus::OutOfBounds);
+}
+
+TEST_F(LoaderTest, RejectsPbpV200WithPsarOffsetNearUint32Max) {
+    const std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0xFFFFFFF0u);
+    Image img;
+    EXPECT_EQ(LoadPBPFromMemory(pbp.data(), pbp.size(), img),
+              LoadStatus::OutOfBounds);
+}
+
+// Смещение проскочило ровно на один байт за конец файла.
+TEST_F(LoaderTest, RejectsPbpV200WithPsarOffsetOneBytePastEnd) {
+    std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0u);
+    const uint32_t past = static_cast<uint32_t>(pbp.size()) + 1u;
+    patchLE32(pbp, 0x08 + 7 * 4, past);
+
+    Image img;
+    EXPECT_EQ(LoadPBPFromMemory(pbp.data(), pbp.size(), img),
+              LoadStatus::OutOfBounds);
+}
+
+// Смещение ровно на границе файла — пустая секция, файл корректен.
+TEST_F(LoaderTest, AcceptsPbpV200WithPsarOffsetAtEndOfFile) {
+    std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0u);
+    patchLE32(pbp, 0x08 + 7 * 4, static_cast<uint32_t>(pbp.size()));
+
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+    ASSERT_EQ(st, LoadStatus::Ok) << StatusName(st);
+    EXPECT_EQ(img.elf.size(), pbp.size() - 0x30u);
+}
+
+// Нормальный случай: data.psar есть и лежит сразу за data.psp.
+TEST_F(LoaderTest, AcceptsPbpV200WithRealPsarSection) {
+    const uint32_t psarOffset = 0x30u + static_cast<uint32_t>(elf.size());
+    std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, psarOffset);
+    for (int i = 0; i < 16; ++i) pbp.push_back(0x00);
+
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+    ASSERT_EQ(st, LoadStatus::Ok) << StatusName(st);
+    EXPECT_EQ(img.elf.size(), elf.size());
+}
+
+// data.psp — последняя секция, data.psar отсутствует: размер берётся
+// по концу файла, а не по 0xFFFFFFFF.
+TEST_F(LoaderTest, AcceptsPbpV200WithoutPsar) {
+    const std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, 0u);
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+    ASSERT_EQ(st, LoadStatus::Ok) << StatusName(st);
+    EXPECT_EQ(img.elf.size(), elf.size());
+}
+
+// Переполнение при проверке «offset + size <= size».
+TEST_F(LoaderTest, RejectsPbpV100WithOversizedDataPspSize) {
+    std::vector<uint8_t> pbp = MakePBP(elf, 0x00010000u);
+    patchLE32(pbp, 0x28, 0xFFFFFF00u);      // data.psp size абсурдно велик
+
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+    EXPECT_NE(st, LoadStatus::Ok);
+    EXPECT_TRUE(img.elf.empty());
+}
+
+TEST_F(LoaderTest, RejectsPbpWithDataPspOffsetPastEnd) {
+    std::vector<uint8_t> pbp = MakePBP(elf, 0x00010000u);
+    patchLE32(pbp, 0x08 + 6 * 4, 0x7FFFFFFFu);
+
+    Image img;
+    EXPECT_NE(LoadPBPFromMemory(pbp.data(), pbp.size(), img), LoadStatus::Ok);
+}
+
+TEST_F(LoaderTest, RejectsPbpWithDataPspOffsetAllOnes) {
+    std::vector<uint8_t> pbp = MakePBP(elf, 0x00010000u);
+    patchLE32(pbp, 0x08 + 6 * 4, 0xFFFFFFFFu);
+
+    Image img;
+    EXPECT_NE(LoadPBPFromMemory(pbp.data(), pbp.size(), img), LoadStatus::Ok);
+}
+
+// Поле размера data.psp нулевое при непустом файле.
+TEST_F(LoaderTest, RejectsPbpV100WithZeroDataPspSize) {
+    std::vector<uint8_t> pbp = MakePBP(elf, 0x00010000u);
+    patchLE32(pbp, 0x28, 0u);
+
+    Image img;
+    EXPECT_EQ(LoadPBPFromMemory(pbp.data(), pbp.size(), img),
+              LoadStatus::EmptyDataPsp);
+}
+
+// Смещение секции указывает внутрь области, занятой другой секцией.
+TEST_F(LoaderTest, RejectsPbpV200WithOverlappingSections) {
+    const uint32_t psarOffset = 0x30u + static_cast<uint32_t>(elf.size());
+    std::vector<uint8_t> pbp = MakePBPv200WithPsar(elf, psarOffset);
+    // data.psp сдвигаем вперёд так, что data.psar оказывается внутри него
+    patchLE32(pbp, 0x08 + 6 * 4, 0x30u + 4u);
+
+    Image img;
+    EXPECT_NE(LoadPBPFromMemory(pbp.data(), pbp.size(), img), LoadStatus::Ok);
+}
+
+// param.sfo помечен как 0xFFFFFFFF — не должно ломать разбор (это
+// «секции нет»), но и не должно читаться как смещение.
+TEST_F(LoaderTest, ToleratesAbsentSfoOffset) {
+    std::vector<uint8_t> pbp = MakePBP(elf, 0x00010000u);
+    patchLE32(pbp, 0x08 + 0 * 4, 0xFFFFFFFFu);
+
+    Image img;
+    const LoadStatus st = LoadPBPFromMemory(pbp.data(), pbp.size(), img);
+    ASSERT_EQ(st, LoadStatus::Ok) << StatusName(st);
+    EXPECT_EQ(img.elf.size(), elf.size());
+    EXPECT_EQ(img.titleId, 0u);
+}
+
+// ---- регрессия: границы сегментов ELF -------------------------------------
+
+TEST(LoaderBoundaryTest, RejectsSegmentWithOverflowingOffsetAndSize) {
+    // p_offset = 0xFFFFFF00, p_filesz = 0x100 — сумма переполняет uint32
+    // и проходит старую проверку `offset + filesz > size`.
+    std::vector<uint8_t> e;
+    e.push_back(0x7F); e.push_back('E'); e.push_back('L'); e.push_back('F');
+    e.push_back(1); e.push_back(1); e.push_back(1);
+    for (int i = 0; i < 9; ++i) e.push_back(0);
+    putLE16(e, 2); putLE16(e, 8); putLE32(e, 1);
+    putLE32(e, 0x08804000u); putLE32(e, 52); putLE32(e, 0); putLE32(e, 0);
+    putLE16(e, 52); putLE16(e, 32); putLE16(e, 1);
+    putLE16(e, 0); putLE16(e, 0); putLE16(e, 0);
+    putLE32(e, 1); putLE32(e, 0xFFFFFF00u); putLE32(e, 0x08804000u);
+    putLE32(e, 0x08804000u);
+    putLE32(e, 0x100u); putLE32(e, 0x100u); putLE32(e, 5); putLE32(e, 0x1000);
+
+    Image img;
+    const LoadStatus st = LoadELF(e.data(), e.size(), img);
+    EXPECT_EQ(st, LoadStatus::OutOfBounds);
+    EXPECT_TRUE(img.segments.empty());
+}
+
+TEST(LoaderBoundaryTest, RejectsSegmentWithMemSizeOverflow) {
+    // p_filesz = 0, p_memsz = 0xFFFFFFFF при p_vaddr в RAM: запись .bss
+    // такого размера должна быть отвергнута, а не тихо обрезана.
+    std::vector<uint8_t> e;
+    e.push_back(0x7F); e.push_back('E'); e.push_back('L'); e.push_back('F');
+    e.push_back(1); e.push_back(1); e.push_back(1);
+    for (int i = 0; i < 9; ++i) e.push_back(0);
+    putLE16(e, 2); putLE16(e, 8); putLE32(e, 1);
+    putLE32(e, 0x08804000u); putLE32(e, 52); putLE32(e, 0); putLE32(e, 0);
+    putLE16(e, 52); putLE16(e, 32); putLE16(e, 1);
+    putLE16(e, 0); putLE16(e, 0); putLE16(e, 0);
+    putLE32(e, 1); putLE32(e, 0); putLE32(e, 0x08804000u);
+    putLE32(e, 0x08804000u);
+    putLE32(e, 0u); putLE32(e, 0xFFFFFFFFu); putLE32(e, 6); putLE32(e, 0x1000);
+
+    Image img;
+    const LoadStatus st = LoadELF(e.data(), e.size(), img);
+    EXPECT_EQ(st, LoadStatus::OutOfBounds);
 }
 
 } // namespace

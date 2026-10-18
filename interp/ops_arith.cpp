@@ -7,6 +7,24 @@ namespace interp {
 
 using core::Decoded;
 
+namespace {
+// Если исключение возникло в слоте задержки, EPC обязан указывать на
+// инструкцию ветвления, а не на инструкцию в слоте.
+inline uint32_t ExceptionEPC(const core::CPUState& cpu, uint32_t pc) {
+    return cpu.InDelaySlot() ? (pc - 4u) : pc;
+}
+} // namespace
+
+// Регистрирует архитектурное исключение Arithmetic Overflow.
+// Ранее здесь ставился PC_HALTED, то есть переполнение останавливало
+// весь эмулятор; это нарушало и MIPS32, и принцип проекта «эмулятор
+// не должен падать на незнакомой ситуации».
+void Interpreter::RaiseOverflow(const Decoded& d, int32_t a, int32_t b) {
+    (void)a; (void)b;
+    cpu_.RaiseException(core::ExcCode::Ov, ExceptionEPC(cpu_, d.pc),
+                        cpu_.InDelaySlot());
+}
+
 bool Interpreter::ExecArith(Decoded& d, StepResult& r) {
     core::CPUState& cpu = cpu_;
     const int32_t simm = static_cast<int16_t>(d.imm);
@@ -16,28 +34,42 @@ bool Interpreter::ExecArith(Decoded& d, StepResult& r) {
         switch (d.funct) {
         case core::Funct::ADD:
         case core::Funct::ADDU: {
-            // Регистр $0 всегда равен нулю.
-            const uint32_t dst = d.rd;
-            const uint32_t res = cpu.Reg(d.rs) + cpu.Reg(d.rt);
-            if (dst != 0) cpu.SetReg(dst,res);
-            // Арифметическое переполнение для ADD
-            if (d.funct == core::Funct::ADD) {
-                const int32_t a = static_cast<int32_t>(cpu.Reg(d.rs));
-                const int32_t b = static_cast<int32_t>(cpu.Reg(d.rt));
-                const int32_t s = static_cast<int32_t>(res);
-                if (((a ^ s) & (b ^ s)) < 0) {
-                    LOG_WARN("Переполнение ADD в PC=0x%08X", d.pc);
-                    cpu.pc = core::PC_HALTED;
-                    r = StepResult::Halted;
-                }
+            // Переполнение возникает только у ADD: ADDU определён так, что
+            // переполнение не возбуждает исключение.
+            const int32_t a = static_cast<int32_t>(cpu.Reg(d.rs));
+            const int32_t b = static_cast<int32_t>(cpu.Reg(d.rt));
+            const int32_t s = static_cast<int32_t>(
+                cpu.Reg(d.rs) + cpu.Reg(d.rt));
+            const bool ovf = (d.funct == core::Funct::ADD) &&
+                          (((a ^ s) & (b ^ s)) < 0);
+
+            if (ovf) {
+                // По MIPS32 результат в rd НЕ записывается, а возбуждается
+                // исключение Arithmetic Overflow (ExcCode 12).
+                LOG_WARN("Переполнение ADD в PC=0x%08X", d.pc);
+                RaiseOverflow(d, a, b);
+                r = StepResult::Exception;
+                return true;
             }
+            if (d.rd != 0) cpu.SetReg(d.rd, static_cast<uint32_t>(s));
             return true;
         }
         case core::Funct::SUB:
         case core::Funct::SUBU: {
-            const uint32_t dst = d.rd;
-            const uint32_t res = cpu.Reg(d.rs) - cpu.Reg(d.rt);
-            if (dst != 0) cpu.SetReg(dst,res);
+            const int32_t a = static_cast<int32_t>(cpu.Reg(d.rs));
+            const int32_t b = static_cast<int32_t>(cpu.Reg(d.rt));
+            const int32_t s = static_cast<int32_t>(
+                cpu.Reg(d.rs) - cpu.Reg(d.rt));
+            const bool ovf = (d.funct == core::Funct::SUB) &&
+                          (((a ^ b) & (a ^ s)) < 0);
+
+            if (ovf) {
+                LOG_WARN("Переполнение SUB в PC=0x%08X", d.pc);
+                RaiseOverflow(d, a, b);
+                r = StepResult::Exception;
+                return true;
+            }
+            if (d.rd != 0) cpu.SetReg(d.rd, static_cast<uint32_t>(s));
             return true;
         }
         case core::Funct::MFHI: if (d.rd != 0) cpu.SetReg(d.rd,cpu.hi); return true;
@@ -64,8 +96,19 @@ bool Interpreter::ExecArith(Decoded& d, StepResult& r) {
     switch (d.opcode) {
     case core::Op::ADDI:
     case core::Op::ADDIU: {
+        // ADDI возбуждает переполнение, ADDIU — нет.
         const uint32_t dst = d.rt;
         const uint32_t res = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
+        if (d.opcode == core::Op::ADDI) {
+            const int32_t a = static_cast<int32_t>(cpu.Reg(d.rs));
+            const int32_t s = static_cast<int32_t>(res);
+            if (((a ^ s) & (s ^ simm)) < 0) {
+                LOG_WARN("Переполнение ADDI в PC=0x%08X", d.pc);
+                RaiseOverflow(d, a, simm);
+                r = StepResult::Exception;
+                return true;
+            }
+        }
         if (dst != 0) cpu.SetReg(dst,res);
         return true;
     }
