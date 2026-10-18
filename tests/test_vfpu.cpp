@@ -250,6 +250,80 @@ TEST_F(VfpuTest, VectorRegisterFileIsFullySized) {
 }
 
 // =========================================================================
+// Соответствие физического расположения регистров архитектурным
+// обозначениям (Hitmen, раздел 4.5.1)
+//
+// VFPU имеет 128 физических регистров по 4 float. Обозначения S/C/R/M/E —
+// это РАЗНЫЕ способы обращения к тем же 128 регистрам:
+//   S000 = регистр 0 lane 0,  S001 = регистр 0 lane 1,
+//   S010 = регистр 1 lane 0,  S011 = регистр 1 lane 1, и т.д.
+//   C/R/M/E переупорядочивают те же байты (строки/столбцы/матрицы).
+//
+// Реализованы только операции размера .s (один lane). Для них номер
+// регистра инструкции — это прямой S-номер, то есть физический индекс
+// vpr[n][0]. Матричная и транспонированная адресация для .s операций
+// не применяется, поэтому соответствие сводится к проверке:
+//   1) индекс регистра = прямой физический индекс;
+//   2) операция .s трогает ТОЛЬКО lane 0.
+// =========================================================================
+
+TEST_F(VfpuTest, SingleLaneIndexIsPhysicalRegisterNumber) {
+    // S010 = регистр 1 lane 0, S011 = регистр 1 lane 1.
+    cpu.vpr[1][0] = 11.0f;
+    cpu.vpr[1][1] = 22.0f;
+    cpu.vpr[1][2] = 33.0f;
+    cpu.vpr[1][3] = 44.0f;
+    cpu.vpr[9][0] = 99.0f;
+
+    // vmov $vd=9 <- $vs=1  (размер .s)
+    exec(encVfpu2(kVfpuVmov, 9, 1));
+
+    EXPECT_FLOAT_EQ(cpu.vpr[9][0], 11.0f)
+        << "S-нумерация должна совпадать с физическим индексом регистра";
+    // Остальные lane регистра-источника не участвуют в операции .s,
+    // но и не должны повреждаться.
+    EXPECT_FLOAT_EQ(cpu.vpr[1][1], 22.0f);
+    EXPECT_FLOAT_EQ(cpu.vpr[1][2], 33.0f);
+    EXPECT_FLOAT_EQ(cpu.vpr[1][3], 44.0f);
+}
+
+TEST_F(VfpuTest, SingleLaneOperationWritesOnlyLaneZero) {
+    // Заполняем все четыре lane регистра-приёмника.
+    for (int lane = 0; lane < 4; ++lane) cpu.vpr[4][lane] = 1.5f * (lane + 1);
+    cpu.vpr[7][0] = 6.0f;
+
+    // vadd.s $vd=4, $vs=7, $vt=4
+    exec(encVfpu3(0x18, kVfpuVadd, 4, 7, 4));
+
+    EXPECT_FLOAT_EQ(cpu.vpr[4][0], 7.5f) << "lane 0 обязан быть перезаписан";
+    EXPECT_FLOAT_EQ(cpu.vpr[4][1], 3.0f) << "lane 1 не участвует в .s";
+    EXPECT_FLOAT_EQ(cpu.vpr[4][2], 4.5f);
+    EXPECT_FLOAT_EQ(cpu.vpr[4][3], 6.0f);
+}
+
+// Операции с размером .p/.t/.q обрабатываются не полностью: это должно
+// быть видно, а не выдаваться за полноценный результат.
+TEST_F(VfpuTest, WiderVectorSizesAreCountedAsPartial) {
+    const uint64_t before = VFPUHandler::partialVectorCount();
+
+    cpu.vpr[1][0] = 10.0f;
+    cpu.vpr[2][0] = 4.0f;
+    // vadd.p: бит 7 установлен
+    exec(encVfpu3(0x18, kVfpuVadd, 3, 1, 2, 1));
+
+    EXPECT_EQ(VFPUHandler::partialVectorCount(), before + 1)
+        << "размер .p не реализован полностью и обязан учитываться";
+}
+
+TEST_F(VfpuTest, SingleSizeIsNotCountedAsPartial) {
+    const uint64_t before = VFPUHandler::partialVectorCount();
+    cpu.vpr[1][0] = 1.0f;
+    cpu.vpr[2][0] = 2.0f;
+    exec(encVfpu3(0x18, kVfpuVadd, 3, 1, 2, 0));   // .s
+    EXPECT_EQ(VFPUHandler::partialVectorCount(), before);
+}
+
+// =========================================================================
 // Интеграция: инструкция должна доходить до обработчика через интерпретатор
 // =========================================================================
 

@@ -332,6 +332,47 @@ TEST(CPUStateTest, EBaseShiftsExceptionVectors) {
     EXPECT_EQ(cpu.ExceptionVector(ExcCode::Ov), 0xBFC00280u);
 }
 
+// MIPS32 Vol. III: EBase используется только при Status.BEV = 0.
+// При BEV = 1 действуют фиксированные загрузочные векторы, и все
+// исключения сходятся на одном адресе.
+TEST(CPUStateTest, BevSelectsBootVectors) {
+    CPUState cpu;
+    cpu.cp0_EBase = 0xBFC00000u;
+
+    cpu.cp0_Status |= ppsspp::core::CP0_STATUS_BEV;
+    EXPECT_EQ(cpu.ExceptionVector(ExcCode::Ov), 0x00000180u)
+        << "при BEV=1 все общие исключения идут на 0x180";
+    EXPECT_EQ(cpu.ExceptionVector(ExcCode::Sys), 0x00000180u);
+    EXPECT_EQ(cpu.ExceptionVector(ExcCode::Bp), 0x00000180u);
+    EXPECT_EQ(cpu.InterruptVector(0), 0x00000380u);
+    EXPECT_EQ(cpu.InterruptVector(4), 0x00000380u + 4u * 0x20u)
+        << "при BEV=1 вектор прерывания отсчитывается от 0x380";
+
+    // Сброс BEV возвращает адресацию через EBase.
+    cpu.cp0_Status &= ~ppsspp::core::CP0_STATUS_BEV;
+    EXPECT_EQ(cpu.ExceptionVector(ExcCode::Ov), 0xBFC00280u);
+    EXPECT_EQ(cpu.InterruptVector(0), 0xBFC00100u);
+}
+
+// EBase выставляется гостевым кодом через mtc0, поэтому BEV и EBase
+// должны влиять на вектор независимо.
+TEST_F(Cop0Test, BevIsGuestControllable) {
+    cpu.gpr[8] = 0x00400000u;                 // Status = BEV
+    interp.StepInstruction(0x08800000u, encMtc0(8, ppsspp::core::CP0_STATUS));
+    EXPECT_NE(cpu.cp0_Status & ppsspp::core::CP0_STATUS_BEV, 0u);
+    EXPECT_EQ(cpu.ExceptionVector(ExcCode::Ov), 0x00000180u);
+}
+
+// ---- вектор прерывания не должен совпадать с вектором исключения ----
+TEST(CPUStateTest, InterruptAndExceptionVectorsDiffer) {
+    CPUState cpu;
+    // ExcCode 0 = Int. Вектор прерывания irq=0 обязан совпадать с
+    // общим вектором, а irq>0 — отличаться.
+    EXPECT_EQ(cpu.InterruptVector(0), cpu.ExceptionVector(ExcCode::Int));
+    EXPECT_NE(cpu.InterruptVector(1), cpu.ExceptionVector(ExcCode::Int));
+    EXPECT_NE(cpu.InterruptVector(1), cpu.ExceptionVector(ExcCode::Ov));
+}
+
 // =========================================================================
 // РЕГРЕССИЯ: переполнение ADD больше не останавливает эмулятор
 // =========================================================================

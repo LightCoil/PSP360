@@ -54,6 +54,7 @@ constexpr uint32_t CP0_STATUS_IE  = 0x00000001u;  // Interrupt Enable
 constexpr uint32_t CP0_STATUS_EXL = 0x00000002u;  // Exception Level
 constexpr uint32_t CP0_STATUS_ERL = 0x00000004u;  // Error Level
 constexpr uint32_t CP0_STATUS_IM  = 0x0000FF00u;  // Interrupt Mask, биты 15..8
+constexpr uint32_t CP0_STATUS_BEV = 0x00400000u;  // Boot Exception Vector, бит 22
 constexpr uint32_t CP0_CAUSE_EXC  = 0x0000007Cu;  // ExcCode, биты 6..2
 constexpr uint32_t CP0_CAUSE_BD   = 0x80000000u;  // Branch Delay
 
@@ -136,10 +137,23 @@ public:
     void RaiseException(ExcCode code, uint32_t epc, bool inDelaySlot);
     bool ExceptionPending() const { return exceptionPending; }
     void ClearExceptionPending() { exceptionPending = false; }
+    // MIPS32 Vol. III: "EBase register for exceptions that occur when
+    // Status.BEV equals 0". При BEV = 1 (загрузка; таблица векторов ещё
+    // не выставлена) используются фиксированные загрузочные векторы:
+    //   общее исключение — 0x00000180 (0x80000180 при Status.BE = 1)
+    //   прерывание        — 0x00000380 + irq * 0x20
+    // Бит 31 (Boot Exception) на PSP равен 0: Allegrex работает в
+    // little-endian, поэтому используется младший адрес.
     uint32_t ExceptionVector(ExcCode code) const {
+        if (cp0_Status & CP0_STATUS_BEV) {
+            return 0x00000180u;
+        }
         return (cp0_EBase + 0x100u) + (static_cast<uint32_t>(code) << 5);
     }
     uint32_t InterruptVector(int irq) const {
+        if (cp0_Status & CP0_STATUS_BEV) {
+            return 0x00000380u + (static_cast<uint32_t>(irq) << 5);
+        }
         return (cp0_EBase + 0x100u) + (static_cast<uint32_t>(irq) << 5);
     }
 

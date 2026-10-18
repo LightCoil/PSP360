@@ -329,6 +329,91 @@ TEST_F(InterpTest, RunCountersAndHalt) {
 }
 
 // =========================================================================
+// РЕГРЕССИЯ: ошибка выборки инструкции
+//
+// Раньше Step() возвращал BusError, не меняя PC, и Run() бесконечно
+// перечитывал один и тот же неотображённый адрес. Теперь возбуждается
+// исключение AdEL, PC перенаправляется на вектор, а если обработчик сам
+// не отображён — исполнение останавливается явно, а не зацикливается.
+// =========================================================================
+
+TEST_F(InterpTest, FetchFaultRaisesAdelException) {
+    cpu.Reset(0x00000000u);          // неотображённый адрес
+
+    const StepResult r = interp.Step();
+
+    EXPECT_EQ(r, StepResult::Exception);
+    EXPECT_NE(cpu.pc, 0x00000000u) << "PC обязан уйти с неотображённого адреса";
+    EXPECT_EQ(cpu.pc, cpu.ExceptionVector(ppsspp::core::ExcCode::AdEL));
+    EXPECT_EQ(cpu.cp0_EPC, 0x00000000u);
+    EXPECT_EQ((cpu.cp0_Cause & ppsspp::core::CP0_CAUSE_EXC) >> 2,
+              static_cast<uint32_t>(ppsspp::core::ExcCode::AdEL));
+    EXPECT_EQ(cpu.cp0_Cause & ppsspp::core::CP0_CAUSE_BD, 0u)
+        << "выборка вне слота задержки -> BD = 0";
+}
+
+TEST_F(InterpTest, FetchFaultInDelaySlotSetsBd) {
+    //   beq $0,$0,target
+    //   <адрес вне памяти в слоте задержки>  -- не отображаем
+    //   target: ...
+    const uint32_t start = 0x08807000u;
+    const uint32_t target = 0x08807100u;
+    const uint32_t imm = static_cast<uint32_t>((target - start - 4) / 4);
+    mem.Write32(start, encI(0x04, 0, 0, static_cast<int32_t>(imm)));
+
+    cpu.Reset(start);
+    interp.Step();                    // beq -> слот задержки
+    // Теперь pc указывает на start+4; делаем его неотображённым,
+    // для чего пишем инструкцию в неотображённый адрес невозможно —
+    // вместо этого переносим pc на неотображённый адрес вручную.
+    cpu.pc = 0x00000000u;
+
+    const StepResult r = interp.Step();
+    EXPECT_EQ(r, StepResult::Exception);
+    EXPECT_NE(cpu.cp0_Cause & ppsspp::core::CP0_CAUSE_BD, 0u);
+}
+
+TEST_F(InterpTest, RunDoesNotSpinOnUnmappedFetch) {
+    // Раньше Run() зацикливался: Step() возвращал BusError, не меняя PC.
+    cpu.Reset(0x00000000u);
+    const uint64_t n = interp.Run(50);
+    EXPECT_LE(n, 2u) << "Run() не должен крутиться на неотображённом адресе";
+    EXPECT_EQ(cpu.pc, core::PC_HALTED)
+        << "обработчик не отображён — исполнение должно быть остановлено";
+}
+
+TEST_F(InterpTest, RunStopsWhenHandlerIsMapped) {
+    // Если обработчик размещён в RAM (через EBase), выполнение
+    // продолжается в нём, а не останавливается.
+    cpu.Reset(0x08808000u);
+    cpu.cp0_EBase = 0x08808000u;
+    const uint32_t vector = cpu.ExceptionVector(ppsspp::core::ExcCode::AdEL);
+    ASSERT_EQ(mem.LastFault(), core::MemFault::None);
+    mem.Write32(vector, encI(0x09, 0, 4, 0x77));
+
+    cpu.pc = 0x00000000u;            // выборка вне памяти -> AdEL
+    interp.Step();
+    EXPECT_EQ(cpu.pc, vector);
+    interp.Step();                   // обработчик
+    EXPECT_EQ(cpu.gpr[4], 0x77u);
+    EXPECT_NE(cpu.pc, core::PC_HALTED);
+}
+
+TEST_F(InterpTest, SuccessfulFetchClearsPreviousFaultFlag) {
+    // Признак ошибки снимается успешным доступом; интерпретатор читает
+    // LastFault сразу после выборки, поэтому подмена невозможна.
+    mem.Write32(0x00000000u, 1u);
+    mem.Read32(0x00000000u);
+    EXPECT_EQ(mem.LastFault(), core::MemFault::Unmapped);
+
+    mem.Write32(kTestPC, encI(0x09, 0, 2, 7));
+    cpu.Reset(kTestPC);
+    interp.Step();
+    EXPECT_EQ(mem.LastFault(), core::MemFault::None);
+    EXPECT_EQ(cpu.gpr[2], 7u);
+}
+
+// =========================================================================
 // РЕГРЕССИЯ: адрес возврата JAL / JALR
 //
 // Адрес возврата определяется адресом самой инструкции: PC + 8

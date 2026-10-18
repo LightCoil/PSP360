@@ -69,6 +69,9 @@ private:
     core::Memory& mem_;
     bool trace_ = false;
     uint64_t unimplementedCount_ = 0;
+    // Истинно, если последняя ошибка выборки инструкции перенаправила PC
+    // в неотображённый обработчик: дальнейшее исполнение бессмысленно.
+    bool fetchFaultLoop_ = false;
 };
 
 } // namespace interp

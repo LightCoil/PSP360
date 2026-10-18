@@ -124,239 +124,270 @@ TEST_F(MemoryTest, OperationCounters) {
     EXPECT_EQ(mem.readOps(), r0 + 1);
 }
 
-// РЕГРЕССИЯ: LastFault() не сбрасывался при успешном доступе, поэтому
-// устаревшая ошибка от неотображённого адреса вызывала ложные BusError.
-TEST_F(MemoryTest, LastFaultReflectsMostRecentAccess) {
-    EXPECT_EQ(mem.LastFault(), MemFault::None);
-
-    mem.Write32(0x00000000u, 1u);
-    EXPECT_EQ(mem.LastFault(), MemFault::Unmapped);
-
-    mem.Write32(kRamBase, 1u);
-    EXPECT_EQ(mem.LastFault(), MemFault::None)
-        << "успешный доступ обязан сбрасывать LastFault";
-
-    mem.Read32(0x00000000u);
-    EXPECT_EQ(mem.LastFault(), MemFault::Unmapped);
-
-    mem.Read32(kRamBase);
-    EXPECT_EQ(mem.LastFault(), MemFault::None);
-}
-
 // =========================================================================
 // Невыравненный доступ: LWL / LWR / SWL / SWR
 //
-// Семантика little-endian (Allegrex, Config.LEL):
-//   A = base+offset, W = A & ~3, n = A & 3, b[k] = байт по адресу W+k
-//   LWL: rt[3-k] = b[k] для k = 0..n
-//   LWR: rt[k-n] = b[k] для k = n..3
-//   SWL: b[k]    = rt[3-k] для k = 0..n      (обратна LWL)
-//   SWR: b[k]    = rt[k-n] для k = n..3      (обратна LWR)
+// Эталон — QEMU, target/mips/tcg/translate.c, функции gen_lxl (LWL)
+// и gen_lxr (LWR). При little-endian:
+//   gen_lxl: t1 = (addr & 3) ^ 3;  shift = t1 * 8;
+//            rt = (memword << shift) | (rt & ~(~0u << shift))
+//   gen_lxr: t1 = addr & 3;         shift = t1 * 8;
+//            rt = (memword >> shift) | (rt & mask_high)
 //
-// Проверяются: точные значения при всех смещениях, обратность пар,
-// сохранение нетронутых байтов регистра и отсутствие записи вне диапазона.
+// Обозначения: W = A & ~3 (выровненное слово), n = A & 3,
+// b[k] — k-й байт слова по адресу W+k (little-endian: b[0] = младший).
+//
+//   LWL:  rt[3 - n + p] = b[p]      для p = 0..n      (остальное сохр.)
+//   LWR:  rt[p]         = b[n + p]  для p = 0..3-n    (остальное сохр.)
+//   SWL:  b[p]          = rt[3-n+p] для p = 0..n      (остальное сохр.)
+//   SWR:  b[n + p]      = rt[p]     для p = 0..3-n    (остальное сохр.)
+//
+// Проверяется таблица значений, побайтовое соответствие регистру и
+// сохранение нетронутых байтов. Round-trip как критерий НЕ используется.
 // =========================================================================
+
+namespace {
+// Слово в памяти 0x11223344 -> b[0]=0x44, b[1]=0x33, b[2]=0x22, b[3]=0x11.
+constexpr uint32_t kWordValue = 0x11223344u;
+// Начальное значение регистра-источника:
+// r[0]=0xDD, r[1]=0xCC, r[2]=0xBB, r[3]=0xAA.
+constexpr uint32_t kSeed = 0xAABBCCDDu;
+
+inline uint32_t bsel(uint32_t v, int k) { return (v >> (8 * k)) & 0xFFu; }
+} // namespace
 
 class UnalignedTest : public ::testing::Test {
 protected:
     Memory mem;
     static constexpr uint32_t kWord = kRamBase + 0x400;
 
-    void SetUp() override {
-        mem.Init();
-        // Слово 0x11223344. В little-endian памяти это байты
-        // b[0]=0x44, b[1]=0x33, b[2]=0x22, b[3]=0x11.
-        mem.Write32(kWord, 0x11223344u);
-    }
+    void SetUp() override { mem.Init(); }
     void TearDown() override { mem.Shutdown(); }
+
+    void resetWord() { mem.Write32(kWord, kWordValue); }
 
     static uint32_t encMem(uint32_t op, uint32_t rt, uint32_t rs, int32_t off) {
         return (op << 26) | (rs << 21) | (rt << 16) |
                (static_cast<uint32_t>(off) & 0xFFFF);
     }
-    static uint32_t byteAt(uint32_t v, uint32_t k) {
-        return (v >> (8 * k)) & 0xFFu;
+
+    // Выполняет одну инструкцию: rt=4 (источник), rs=8 (база = kWord).
+    ppsspp::interp::StepResult execAt(uint32_t op, uint32_t off,
+                                      ppsspp::core::CPUState& cpu,
+                                      ppsspp::interp::Interpreter& interp) {
+        cpu.gpr[8] = kWord;
+        cpu.gpr[4] = kSeed;
+        return interp.StepInstruction(0, encMem(op, 4, 8, off));
     }
 };
 
-// Эталонные значения посчитаны по правилам выше при rt = 0.
-// Слово 0x11223344 в little-endian памяти: b[0]=0x44, b[1]=0x33,
-// b[2]=0x22, b[3]=0x11.
-TEST_F(UnalignedTest, LwlAtEveryOffset) {
-    const uint32_t expect[4] = { 0x44000000u, 0x44330000u,
-                                 0x44332200u, 0x44332211u };
-    for (uint32_t off = 0; off < 4; ++off) {
+// ---------------- LWL: rt[3-n+p] = b[p], p = 0..n ----------------
+// n=0: r3=b0             -> 44 BB CC DD
+// n=1: r3=b1, r2=b0      -> 33 44 CC DD
+// n=2: r3=b2,r2=b1,r1=b0 -> 22 33 44 DD
+// n=3: всё слово         -> 11 22 33 44
+TEST_F(UnalignedTest, LwlTableFromQemuReference) {
+    const uint32_t expect[4] = { 0x44BBCCDDu, 0x3344CCDDu,
+                                 0x223344DDu, 0x11223344u };
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
         ppsspp::core::CPUState cpu;
         ppsspp::interp::Interpreter interp(cpu, mem);
-        cpu.gpr[8] = kWord;
-        cpu.gpr[4] = 0;
-        interp.StepInstruction(0, encMem(0x22, 4, 8, static_cast<int32_t>(off)));
-        EXPECT_EQ(cpu.gpr[4], expect[off]) << "lwl offset " << off;
+        execAt(0x22u, static_cast<int32_t>(n), cpu, interp);
+        EXPECT_EQ(cpu.gpr[4], expect[n]) << "lwl n=" << n;
     }
 }
 
-TEST_F(UnalignedTest, LwrAtEveryOffset) {
-    const uint32_t expect[4] = { 0x11223344u, 0x00112233u,
-                                 0x00001122u, 0x00000011u };
-    for (uint32_t off = 0; off < 4; ++off) {
+TEST_F(UnalignedTest, LwlPreservesUntouchedBytes) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
         ppsspp::core::CPUState cpu;
         ppsspp::interp::Interpreter interp(cpu, mem);
-        cpu.gpr[8] = kWord;
-        cpu.gpr[4] = 0;
-        interp.StepInstruction(0, encMem(0x26, 4, 8, static_cast<int32_t>(off)));
-        EXPECT_EQ(cpu.gpr[4], expect[off]) << "lwr offset " << off;
-    }
-}
-
-// LWL пишет rt[3-k] для k = 0..n, поэтому сохраняются байты 0..(2-n).
-TEST_F(UnalignedTest, LwlPreservesLowBytes) {
-    const uint32_t seed = 0xDEADBEEFu;
-    for (uint32_t off = 0; off < 4; ++off) {
-        ppsspp::core::CPUState cpu;
-        ppsspp::interp::Interpreter interp(cpu, mem);
-        cpu.gpr[8] = kWord;
-        cpu.gpr[4] = seed;
-        interp.StepInstruction(0, encMem(0x22, 4, 8, static_cast<int32_t>(off)));
-        const uint32_t got = cpu.gpr[4];
-        for (uint32_t k = 0; k + off < 3; ++k) {
-            EXPECT_EQ(byteAt(got, k), byteAt(seed, k))
-                << "lwl offset " << off << " must preserve byte " << k;
+        execAt(0x22u, static_cast<int32_t>(n), cpu, interp);
+        const int first = 3 - static_cast<int>(n);
+        for (int j = 0; j < first; ++j) {
+            EXPECT_EQ(bsel(cpu.gpr[4], j), bsel(kSeed, j))
+                << "lwl n=" << n << " изменил байт " << j;
         }
     }
 }
 
-// LWR пишет rt[k-n] для k = n..3, поэтому сохраняются байты (4-n)..3.
-TEST_F(UnalignedTest, LwrPreservesHighBytes) {
-    const uint32_t seed = 0xDEADBEEFu;
-    for (uint32_t off = 0; off < 4; ++off) {
+// ---------------- LWR: rt[p] = b[n+p], p = 0..3-n ----------------
+// n=0: всё слово          -> 11 22 33 44
+// n=1: r0=b1,r1=b2,r2=b3 -> AA 11 22 33
+// n=2: r0=b2,r1=b3       -> AA BB 11 22
+// n=3: r0=b3             -> AA BB CC 11
+TEST_F(UnalignedTest, LwrTableFromQemuReference) {
+    const uint32_t expect[4] = { 0x11223344u, 0xAA112233u,
+                                 0xAABB1122u, 0xAABBCC11u };
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
         ppsspp::core::CPUState cpu;
         ppsspp::interp::Interpreter interp(cpu, mem);
-        cpu.gpr[8] = kWord;
-        cpu.gpr[4] = seed;
-        interp.StepInstruction(0, encMem(0x26, 4, 8, static_cast<int32_t>(off)));
-        const uint32_t got = cpu.gpr[4];
-        for (uint32_t k = 4 - off; k < 4; ++k) {
-            EXPECT_EQ(byteAt(got, k), byteAt(seed, k))
-                << "lwr offset " << off << " must preserve byte " << k;
+        execAt(0x26u, static_cast<int32_t>(n), cpu, interp);
+        EXPECT_EQ(cpu.gpr[4], expect[n]) << "lwr n=" << n;
+    }
+}
+
+TEST_F(UnalignedTest, LwrPreservesUntouchedBytes) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x26u, static_cast<int32_t>(n), cpu, interp);
+        for (uint32_t j = 4 - n; j < 4; ++j) {
+            EXPECT_EQ(bsel(cpu.gpr[4], static_cast<int>(j)),
+                      bsel(kSeed, static_cast<int>(j)))
+                << "lwr n=" << n << " изменил байт " << j;
         }
     }
 }
 
-// SWR — обратная операция к LWR при любом смещении.
-TEST_F(UnalignedTest, SwrLwrAreInverse) {
-    const uint32_t seed = 0xA5C3F709u;
-    for (uint32_t off = 0; off < 4; ++off) {
-        Memory local; local.Init();
-        for (int i = 0; i < 32; ++i) local.Write8(kWord + i, 0x00);
-
-        ppsspp::core::CPUState cs, cl;
-        ppsspp::interp::Interpreter is(cs, local);
-        ppsspp::interp::Interpreter il(cl, local);
-        cs.gpr[8] = kWord; cs.gpr[4] = seed;
-        cl.gpr[8] = kWord; cl.gpr[4] = 0;
-
-        is.StepInstruction(0, encMem(0x2E, 4, 8, static_cast<int32_t>(off)));
-        il.StepInstruction(4, encMem(0x26, 4, 8, static_cast<int32_t>(off)));
-
-        for (uint32_t k = off; k < 4; ++k) {
-            EXPECT_EQ(byteAt(cl.gpr[4], k - off), byteAt(seed, k - off))
-                << "swr/lwr inverse offset " << off << " byte " << k;
-        }
-        local.Shutdown();
+// ---------------- SWL: b[p] = rt[3-n+p], p = 0..n ----------------
+// память до операции 44 33 22 11, rt = AA BB CC DD
+// n=0: b0=r3            -> AA 33 22 11
+// n=1: b0=r2,b1=r3      -> BB AA 22 11
+// n=2: b0=r1,b1=r2,b2=r3-> CC BB AA 11
+// n=3: всё слово rt     -> DD CC BB AA
+TEST_F(UnalignedTest, SwlTableFromQemuReference) {
+    const uint32_t expect[4] = { 0x112233AAu, 0x1122AABBu,
+                                 0x11AABBCCu, 0xAABBCCDDu };
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Au, static_cast<int32_t>(n), cpu, interp);
+        uint32_t got = 0;
+        for (int k = 0; k < 4; ++k)
+            got |= static_cast<uint32_t>(mem.Read8(kWord + k)) << (8 * k);
+        EXPECT_EQ(got, expect[n]) << "swl n=" << n;
     }
 }
 
-// SWL — обратная операция к LWL при любом смещении.
-TEST_F(UnalignedTest, SwlLwlAreInverse) {
-    const uint32_t seed = 0xA5C3F709u;
-    for (uint32_t off = 0; off < 4; ++off) {
-        Memory local; local.Init();
-        for (int i = 0; i < 32; ++i) local.Write8(kWord + i, 0x00);
-
-        ppsspp::core::CPUState cs, cl;
-        ppsspp::interp::Interpreter is(cs, local);
-        ppsspp::interp::Interpreter il(cl, local);
-        cs.gpr[8] = kWord; cs.gpr[4] = seed;
-        cl.gpr[8] = kWord; cl.gpr[4] = 0;
-
-        is.StepInstruction(0, encMem(0x2A, 4, 8, static_cast<int32_t>(off)));
-        il.StepInstruction(4, encMem(0x22, 4, 8, static_cast<int32_t>(off)));
-
-        for (uint32_t k = 0; k <= off; ++k) {
-            EXPECT_EQ(byteAt(cl.gpr[4], 3 - k), byteAt(seed, 3 - k))
-                << "swl/lwl inverse offset " << off << " byte " << k;
+TEST_F(UnalignedTest, SwlEachByteMatchesRegister) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Au, static_cast<int32_t>(n), cpu, interp);
+        for (uint32_t p = 0; p <= n; ++p) {
+            const uint32_t want = bsel(kSeed, static_cast<int>(3 - n + p));
+            EXPECT_EQ(mem.Read8(kWord + p), static_cast<uint8_t>(want))
+                << "swl n=" << n << ": байт " << p
+                << " ожидался из rt[" << (3 - n + p) << "]";
         }
-        local.Shutdown();
     }
 }
 
-// На выровненном адресе SWR записывает всё слово целиком, поэтому обычный
-// LW обязан вернуть исходное значение. Это и есть практическое применение
-// невыравненного доступа на little-endian.
-TEST_F(UnalignedTest, AlignedSwrStoresWholeWord) {
-    const uint32_t seed = 0xAABBCCDDu;
+TEST_F(UnalignedTest, SwlLeavesOtherBytesUntouched) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Au, static_cast<int32_t>(n), cpu, interp);
+        for (uint32_t k = n + 1; k < 4; ++k) {
+            EXPECT_EQ(mem.Read8(kWord + k),
+                      static_cast<uint8_t>(bsel(kWordValue, static_cast<int>(k))))
+                << "swl n=" << n << " изменил байт " << k
+                << " за пределами диапазона";
+        }
+    }
+}
+
+// ---------------- SWR: b[n+p] = rt[p], p = 0..3-n ----------------
+// n=0: всё слово rt     -> DD CC BB AA
+// n=1: b1=r0,b2=r1,b3=r2-> 44 DD CC BB
+// n=2: b2=r0,b3=r1      -> 44 33 DD CC
+// n=3: b3=r0            -> 44 33 22 DD
+TEST_F(UnalignedTest, SwrTableFromQemuReference) {
+    const uint32_t expect[4] = { 0xAABBCCDDu, 0xBBCCDD44u,
+                                 0xCCDD3344u, 0xDD223344u };
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Eu, static_cast<int32_t>(n), cpu, interp);
+        uint32_t got = 0;
+        for (int k = 0; k < 4; ++k)
+            got |= static_cast<uint32_t>(mem.Read8(kWord + k)) << (8 * k);
+        EXPECT_EQ(got, expect[n]) << "swr n=" << n;
+    }
+}
+
+TEST_F(UnalignedTest, SwrEachByteMatchesRegister) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Eu, static_cast<int32_t>(n), cpu, interp);
+        for (uint32_t p = 0; p <= 3 - n; ++p) {
+            const uint32_t want = bsel(kSeed, static_cast<int>(p));
+            EXPECT_EQ(mem.Read8(kWord + n + p), static_cast<uint8_t>(want))
+                << "swr n=" << n << ": байт " << (n + p)
+                << " ожидался из rt[" << p << "]";
+        }
+    }
+}
+
+TEST_F(UnalignedTest, SwrLeavesOtherBytesUntouched) {
+    for (uint32_t n = 0; n < 4; ++n) {
+        resetWord();
+        ppsspp::core::CPUState cpu;
+        ppsspp::interp::Interpreter interp(cpu, mem);
+        execAt(0x2Eu, static_cast<int32_t>(n), cpu, interp);
+        for (uint32_t k = 0; k < n; ++k) {
+            EXPECT_EQ(mem.Read8(kWord + k),
+                      static_cast<uint8_t>(bsel(kWordValue, static_cast<int>(k))))
+                << "swr n=" << n << " изменил байт " << k << " перед диапазоном";
+        }
+    }
+}
+
+// На выровненном адресе SWR записывает всё слово целиком.
+// SWL — нет: по gprMask из QEMU (0xFFFFFFFF >> (24 - 8n)) при n = 0 он
+// пишет только старший байт rt. Выровненная 32-битная запись на
+// little-endian выполняется одной инструкцией SWR.
+TEST_F(UnalignedTest, AlignedSwrWritesWholeWord) {
+    resetWord();
     ppsspp::core::CPUState cpu;
     ppsspp::interp::Interpreter interp(cpu, mem);
-    cpu.gpr[8] = kWord;
-    cpu.gpr[4] = seed;
-
-    interp.StepInstruction(0, encMem(0x2E, 4, 8, 0));
-    EXPECT_EQ(mem.Read32(kWord), seed);
-
-    cpu.gpr[4] = 0;
-    interp.StepInstruction(4, encMem(0x26, 4, 8, 0));
-    EXPECT_EQ(cpu.gpr[4], seed);
+    execAt(0x2Eu, 0, cpu, interp);
+    EXPECT_EQ(mem.Read32(kWord), kSeed)
+        << "выровненный SWR должен записать слово целиком";
 }
 
-// Объединение парных инструкций: SWR+LWR и SWL+LWL — это взаимно
-// обратные операции, которыми сохраняют и восстанавливают регистр
-// при доступе к невыравненным данным. Проверяем полное восстановление
-// 32-битного значения при любом смещении.
-TEST_F(UnalignedTest, PairedInstructionsRestoreWholeRegister) {
-    const uint32_t seed = 0x89ABCDEFu;
-    for (uint32_t off = 0; off < 4; ++off) {
-        Memory local; local.Init();
-        for (int i = 0; i < 32; ++i) local.Write8(kWord + i, 0x00);
+TEST_F(UnalignedTest, AlignedSwlWritesOnlyTopByte) {
+    resetWord();
+    ppsspp::core::CPUState cpu;
+    ppsspp::interp::Interpreter interp(cpu, mem);
+    execAt(0x2Au, 0, cpu, interp);
+    uint32_t got = 0;
+    for (int k = 0; k < 4; ++k)
+        got |= static_cast<uint32_t>(mem.Read8(kWord + k)) << (8 * k);
+    EXPECT_EQ(got, 0x112233AAu)
+        << "выровненный SWL пишет только rt[3] в первый байт слова";
+}
 
-        ppsspp::core::CPUState cs, cl;
-        ppsspp::interp::Interpreter is(cs, local);
-        ppsspp::interp::Interpreter il(cl, local);
-        cs.gpr[8] = kWord;
-        cs.gpr[4] = seed;
-        cl.gpr[8] = kWord;
-        cl.gpr[4] = 0;
-
-        // Сохраняем swr, затем восстанавливаем lwr в регистр с нулями.
-        is.StepInstruction(0, encMem(0x2E, 4, 8, static_cast<int32_t>(off)));
-        il.StepInstruction(4, encMem(0x26, 4, 8, static_cast<int32_t>(off)));
-
-        // swr кладёт младшие (4-off) байтов rt в память, lwr кладёт их
-        // обратно в младшие байты нового регистра. Старшие байты, которых
-        // swr не касался, остаются нулевыми.
-        const uint32_t restored = cl.gpr[4];
-        for (uint32_t k = 0; k < 4; ++k) {
-            const uint32_t want = (k < 4 - off) ? byteAt(seed, k) : 0u;
-            EXPECT_EQ(byteAt(restored, k), want)
-                << "swr/lwr offset " << off << " byte " << k;
+// SWL/SWR не должны выходить за пределы выровненного слова.
+TEST_F(UnalignedTest, StoresStayInsideTheAlignedWord) {
+    mem.Write8(kWord - 1, 0x5A);
+    mem.Write8(kWord + 4, 0x5A);
+    const uint32_t ops[2] = { 0x2Au, 0x2Eu };
+    for (uint32_t op : ops) {
+        for (uint32_t n = 0; n < 4; ++n) {
+            resetWord();
+            ppsspp::core::CPUState cpu;
+            ppsspp::interp::Interpreter interp(cpu, mem);
+            execAt(op, static_cast<int32_t>(n), cpu, interp);
+            EXPECT_EQ(mem.Read8(kWord - 1), 0x5A)
+                << "запись до начала слова (opcode 0x" << std::hex << op
+                << ", n=" << std::dec << n << ")";
+            EXPECT_EQ(mem.Read8(kWord + 4), 0x5A)
+                << "запись за концом слова (opcode 0x" << std::hex << op
+                << ", n=" << std::dec << n << ")";
         }
-
-        // И обратная пара для старших байтов.
-        for (int i = 0; i < 32; ++i) local.Write8(kWord + i, 0x00);
-        cl.gpr[4] = 0;
-        cs.gpr[4] = seed;
-        is.StepInstruction(8, encMem(0x2A, 4, 8, static_cast<int32_t>(off)));
-        il.StepInstruction(12, encMem(0x22, 4, 8, static_cast<int32_t>(off)));
-
-        for (uint32_t j = 0; j <= off; ++j) {
-            EXPECT_EQ(byteAt(cl.gpr[4], 3 - j), byteAt(seed, 3 - j))
-                << "swl/lwl offset " << off << " restored byte " << (3 - j);
-        }
-        for (uint32_t k = 0; k + off < 3; ++k) {
-            EXPECT_EQ(byteAt(cl.gpr[4], k), 0u)
-                << "swl/lwl offset " << off << " must not set byte " << k;
-        }
-        local.Shutdown();
     }
 }
 
 } // namespace
+

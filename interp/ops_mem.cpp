@@ -51,18 +51,19 @@ bool Interpreter::ExecMemory(Decoded& d, StepResult& r) {
     // LWL/LWR — загрузка невыровненного слова. На PSP не используются
     // (операции выровнены), реализованы для полноты.
     case core::Op::LWL: {
-        // Семантика little-endian (Allegrex, Config.LEL).
-        // A = base+offset, W = A & ~3, n = A & 3, b[k] — k-й байт слова W.
-        //   LWL: rt[3-k] = b[k]  для k = 0..n
-        // SWL — обратная операция. Отображение byte k -> byte (3-k) есть
-        // перестановка байтов, а не сдвиг, поэтому выполняется поэлементно.
+        // Эталон — QEMU gen_lxl (target/mips/tcg/translate.c):
+        //   t1 = (addr & 3) ^ 3;  shift = t1 * 8;      // little-endian
+        //   rt = (memword << shift) | (rt & ~(~0u << shift))
+        // Побайтно (W = addr & ~3, n = addr & 3, b[k] = байт по адресу W+k):
+        //   rt[3 - n + p] = b[p]   для p = 0..n
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
         const uint32_t base = addr & ~3u;
         const uint32_t n    = addr & 3u;
         uint32_t value = cpu.Reg(d.rt);
-        for (uint32_t k = 0; k <= n; ++k) {
-            const uint32_t shift = 8u * (3u - k);
-            value = (value & ~(0xFFu << shift)) | (mem_.Read8(base + k) << shift);
+        for (uint32_t p = 0; p <= n; ++p) {
+            const uint32_t dstShift = 8u * (3u - n + p);
+            value = (value & ~(0xFFu << dstShift)) |
+                    (mem_.Read8(base + p) << dstShift);
         }
         if (d.rt != 0) cpu.SetReg(d.rt, value);
         return true;
@@ -100,14 +101,16 @@ bool Interpreter::ExecMemory(Decoded& d, StepResult& r) {
         return true;
     }
     case core::Op::SWL: {
-        // Обратная операция к LWL: b[k] = rt[3-k]  для k = 0..n
+        // Обратная операция к LWL (та же раскладка байтов):
+        //   b[p] = rt[3 - n + p]   для p = 0..n
         const uint32_t addr = cpu.Reg(d.rs) + static_cast<uint32_t>(simm);
         const uint32_t base = addr & ~3u;
         const uint32_t n    = addr & 3u;
         const uint32_t src  = cpu.Reg(d.rt);
-        for (uint32_t k = 0; k <= n; ++k) {
-            const uint32_t shift = 8u * (3u - k);
-            mem_.Write8(base + k, static_cast<uint8_t>((src >> shift) & 0xFFu));
+        for (uint32_t p = 0; p <= n; ++p) {
+            const uint32_t srcShift = 8u * (3u - n + p);
+            mem_.Write8(base + p,
+                        static_cast<uint8_t>((src >> srcShift) & 0xFFu));
         }
         return true;
     }

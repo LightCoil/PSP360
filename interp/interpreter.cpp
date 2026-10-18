@@ -117,9 +117,34 @@ StepResult Interpreter::Step() {
     const uint32_t word = mem_.Read32(pc);
 
     if (mem_.LastFault() != core::MemFault::None) {
+        // Ошибка выборки инструкции. Диагностика снимается СРАЗУ, до
+        // любых других обращений к памяти: LastFault хранит результат
+        // только последней операции, и любое успешное чтение после
+        // ошибки стёрло бы признак.
         LOG_ERROR("Ошибка чтения инструкции по адресу 0x%08X", pc);
-        return StepResult::BusError;
+
+        // Ошибка адреса при выборке -> AdEL (ExcCode 4). Раньше здесь
+        // возвращался BusError без изменения PC, из-за чего Run()
+        // бесконечно перечитывал тот же неотображённый адрес.
+        const bool inDelay = cpu_.InDelaySlot();
+        cpu_.RaiseException(core::ExcCode::AdEL, inDelay ? (pc - 4u) : pc, inDelay);
+        const uint32_t vector = cpu_.ExceptionVector(core::ExcCode::AdEL);
+        cpu_.ClearExceptionPending();
+
+        // Если обработчик сам находится в неотображённой памяти, PC не
+        // изменится и Run() зациклится. Это фиксируется заранее.
+        bool handlerUnmapped = (vector == pc);
+        if (!handlerUnmapped) {
+            (void)mem_.Read32(vector);      // проверка отображённости вектора
+            handlerUnmapped = (mem_.LastFault() != core::MemFault::None);
+        }
+        cpu_.pc     = vector;
+        cpu_.nextPC = vector + 4;
+        cpu_.SetInDelaySlot(false);
+        fetchFaultLoop_ = handlerUnmapped;
+        return StepResult::Exception;
     }
+    fetchFaultLoop_ = false;
 
     // Модель MIPS: слот задержки обеспечивается сдвигом pc/nextPC
     // до выполнения инструкции.
@@ -151,7 +176,20 @@ uint64_t Interpreter::Run(uint64_t maxInstructions) {
     uint64_t executed = 0;
     while (cpu_.pc != core::PC_HALTED) {
         if (maxInstructions != 0 && executed >= maxInstructions) break;
-        Step();
+
+        const uint32_t pcBefore = cpu_.pc;
+        const StepResult r = Step();
+
+        // Ошибка выборки перебросила PC в неотображённый обработчик:
+        // продолжать некуда, иначе цикл не прервётся.
+        if (r == StepResult::Exception && fetchFaultLoop_) {
+            LOG_ERROR("Обработчик исключения по адресу 0x%08X не отображён; "
+                      "выполнение остановлено (исходный PC 0x%08X)",
+                      cpu_.pc, pcBefore);
+            cpu_.pc = core::PC_HALTED;
+            cpu_.nextPC = core::PC_HALTED;
+            break;
+        }
         ++executed;
     }
     return executed;
