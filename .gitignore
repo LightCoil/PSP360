@@ -7,3 +7,4 @@ out/
 *.pdb
 *.ilk
 *.log
+toolchain/dist/
