@@ -1,150 +1,263 @@
-# Состояние тулчейна Xbox 360 — проверено 18.10.2026
+# Состояние Xenon-тулчейна
 
-## Короткий ответ
+Фактическое состояние проверено **18 октября 2026**. Документ описывает
+что реально есть, что проверено, а что заблокировано. Утверждения без
+проверки здесь не приводятся.
 
-**Собранного тулчейна на этой машине нет. Ни одного исполняемого файла.**
+---
 
-Сборка тулчейна **запускалась 21.06.2025 и оборвалась на этапе configure/make**,
-не дойдя до компиляции ни одного бинарника. Всё, что сохранилось, — это
-исходники и рецепт сборки.
+## 1. Краткий итог
 
-## Что проверено
+| Уровень | Состояние |
+|---|---|
+| Скрипт сборки | **исправлен и протестирован** (11/11 проверок) |
+| Патчи (в т.ч. VMX128 для binutils 2.32) | **перенесены и проверены** |
+| Конфигурация binutils для цели `xenon` | **проходит** |
+| Сборка binutils | **заблокирована окружением** |
+| Сборка gcc / newlib | **не начата** (тот же блокер) |
+| Готовый тулчейн на машине | **отсутствует** |
+| Xenia | **не установлена** |
 
-| Что искали | Где | Результат |
-|------------|-----|-----------|
-| `xenon-gcc.exe`, `xenon-g++.exe` | C:, D:, E:, J: | не найдены |
-| `powerpc-eabi-gcc.exe`, `powerpc-eabi-g++.exe` | C:, D:, E:, J: | не найдены |
-| `powerpc-eabi-ld.exe`, `-as.exe`, `-objcopy.exe` | C:, D:, E:, J: | не найдены |
-| `xenon-elf-to-xex.exe` | C:, D:, E:, J: | не найден |
-| `nxe-stage0.exe` (NewXeXEra) | C:, D:, E:, J: | не найден |
-| Каталог `toolchain/bin` | `D:\PSP360\libxenon-master\toolchain` | **отсутствует** |
-| Исполняемые файлы в `toolchain/build` | там же | **0 штук** |
+Блокер сборки — несовместимость окружения, подробности в разделе 5.
 
-## Доказательства того, что сборка не завершилась
+---
 
-`toolchain/build.log` (39 байт, весь файл):
-
-```
-patching file binutils-2.32/config.sub
-```
-
-Обрыв на первом же шаге скрипта.
-
-`toolchain/build/build.log` заканчивается так:
-
-```
-make[1]: Entering directory '/h/tools/New XeX Era/libxenon-master/toolchain/build'
-mkdir -p -- ./libiberty
-Configuring in ./libiberty
-mkdir -p -- ./intl
-Configuring in ./intl
-mkdir -p -- ./bfd
-Configuring in ./bfd
-make[2]: Entering directory '.../build/libiberty'
-make[2]: Leaving directory '.../build/libiberty'
-make[1]: Leaving directory '.../build'
-```
-
-Configure отработал (`config.log`, `config.status`, `Makefile` на 410 КБ
-сгенерированы), но после этого `make` ушёл в подкаталоги и вышел.
-Ни `as`, ни `ld`, ни `objcopy` не собраны.
-
-Дополнительно: VMX128-патч **не применён** к распакованным исходникам —
-в `binutils-2.32/gas/config/tc-ppc.c` ноль вхождений `vmx128`/`efp`.
-
-Обратите внимание на путь в логе: `/h/tools/New XeX Era/...` — сборка шла
-с диска `H:`, которого сейчас в системе нет.
-
-## Что было скопировано в psp360Phoenix
-
-### `toolchain/` — рецепт сборки Xenon-тулчейна
+## 2. Состав каталога
 
 ```
 toolchain/
-  patches/                        ← ЦЕННОЕ, воспроизвести нельзя
-    binutils-2.28-vmx128.diff     19 822 байт  ← поддержка VMX128 (векторный
-                                              блок Xbox 360)
-    binutils-2.32.diff                330
-    binutils-2.28.diff                392
-    binutils-2.22.diff                367
-    gcc-9.2.0.diff                  6 504
-    gcc-6.3.0.diff                  7 209
-    gcc-4.7.1.diff                  7 229
-    newlib-3.1.0.diff                 467
-    newlib-2.5.0.diff                 445
-    newlib-1.20.0.diff                482
-  build-xenon-toolchain.sh       16 960 байт  ← скрипт сборки
-  dist/                                        ← для пересборки офлайн
-    gcc-9.2.0.tar.gz             124 304 709
-    binutils-2.32.tar.gz          41 123 367
-    newlib-3.1.0.tar.gz           17 958 952
-  logs/
-    toolchain-build.log                  39   ← обрыв на config.sub
-    binutils-configure.log             4 489
-    binutils-config.log                26 667
-    binutils-config.status             33 302
+  build-xenon-toolchain.sh      скрипт сборки (исправлен)
+  .gitignore                    политика хранения артефактов
+  dist/                         исходные архивы, НЕ в git (~183 МБ)
+    CHECKSUMS.sha512            манифест, В git
+    binutils-2.32.tar.gz
+    gcc-9.2.0.tar.gz
+    newlib-3.1.0.tar.gz
+  patches/                      патчи, В git
+    binutils-2.32.diff          config.sub: цель xenon
+    binutils-2.32-vmx128.diff   ПОРТ VMX128 с 2.28 на 2.32 (новый)
+    gcc-9.2.0.diff              config.sub + altivec.md
+    newlib-3.1.0.diff           config.sub
+    binutils-2.28*.diff         старые версии, для binutils 2.28,
+                                НЕ применяются к 2.32
+    gcc-4.7.1.diff, gcc-6.3.0.diff, newlib-1.20.0.diff, newlib-2.5.0.diff,
+    binutils-2.22.diff          аналогично - оставлены для справки
+  logs/                         логи, В git
+  src/                          распакованные исходники, НЕ в git
+  build/                        объекты сборки, НЕ в git
 ```
 
-### `third_party/xex_writer/` — библиотека записи XEX (23 файла)
+`dist/` не отслеживается git намеренно: это 183 МБ исходников. Поэтому
+**офлайн-сборка из свежего клона невозможна**, пока файлы не будут
+положены в `dist/` вручную либо загружены при первом запуске.
+Манифест `dist/CHECKSUMS.sha512` отслеживается и позволяет проверить,
+что именно должно лежать в каталоге.
 
-`xex_writer.hpp`, `xex_writer.cpp`, `xex_writer_full.cpp`, CMakeLists,
-тесты, плюс 11 документов `.docx` с описанием формата XEX2.
-Рабочий код. **Не переписывать — использовать.**
+---
 
-### `third_party/x360make/` — собственный билдер проекта
+## 3. Как запустить
 
-```
-crt/crt0.S          62 байта   ← точка входа для Xenon
-crt/xex.ld          137        ← линкер-скрипт XEX
-src/  main, core_build, downloader, gui, locale, logger, packer, unzip
-include/  соответствующие заголовки
-```
-
-## Что НЕ копировалось и почему
-
-| Путь | Размер | Причина |
-|------|--------|---------|
-| `D:\PSP360\libxenon-master\toolchain\binutils-2.32\` | 220 МБ | распакованные публичные исходники; патчи к ним не применены, состояние = pristine. Восстанавливается `tar xf dist/binutils-2.32.tar.gz` |
-| `.../toolchain\build\` | ~500 КБ | Makefile на 410 КБ регенерируется через `./configure`; логи уже скопированы |
-
-Итого в `psp360Phoenix` перенесено **~184 МБ** (из них 183 МБ — публичные
-tarball-ы) и **~470 КБ** действительно уникального кода и знаний.
-
-## Важное замечание о патчах
-
-`binutils-2.28-vmx128.diff` написан для **binutils 2.28**, а в наличии лежит
-tarball **binutils-2.32**. То есть самый ценный патч (поддержка VMX128)
-потребует переноса на 2.32 — либо сборки на версии 2.28. Это отдельная задача,
-и до неё тулчейн работать не будет: Xenon — это PowerPC 750 с векторным
-расширением VMX128, без него компилятор генерирует неверный код для
-векторных операций.
-
-## Как собрать тулчейн из того, что сохранено
-
-Требуется MSYS2 или Cygwin с make, autoconf, automake, bison, flex, texinfo.
+Скрипт одинаково работает из корня репозитория, из `toolchain/` и из
+любого другого каталога: все пути вычисляются от расположения скрипта.
 
 ```bash
-cd toolchain
-bash build-xenon-toolchain.sh
+# из корня репозитория
+./toolchain/build-xenon-toolchain.sh toolchain
+
+# из каталога toolchain
+./build-xenon-toolchain.sh toolchain
+
+# только из локальных архивов, без сети
+OFFLINE=1 ./toolchain/build-xenon-toolchain.sh toolchain
+
+# другой префикс и число потоков
+PREFIX=$HOME/xenon JOBS=8 ./toolchain/build-xenon-toolchain.sh toolchain
 ```
 
-Скрипт сам распакует tarball-ы из `dist/` и применит патчи из `patches/`.
-Ожидаемое время: 40–70 минут.
+Проверка синтаксиса:
 
-Либо проще — поставить готовый devkitXenon:
-<https://github.com/ConsolePioneer/libxenon> (нужна сборка тулчейна)
-или готовый пакет <https://wii.leseratte10.de/devkitPro/>.
-
-## Где ещё можно поискать исходники NewXeXEra
-
-Проект `H:\tools\NewXeXEra\modern_toolchain` (Python, «новый язык XEX»)
-утрачен, но его **содержимое сохранилось в векторном индексе Continue**:
-
-```
-C:\Users\Rapture\.continue\index\lancedb\
-    fileh3AtoolsNewXeXEramodern_toolchainmastervectordb_TransformersJsEmbeddingsProviderall-MiniLM-L6-v2500.lance\
-        data\   246 сегментов, 224 МБ
+```bash
+bash -n toolchain/build-xenon-toolchain.sh
 ```
 
-Колонка `contents` содержит текст исходных файлов **без сжатия** —
-читается обычным поиском по байтам. Проверено.
+Коды возврата: `0` — успех, `1` — ошибка (включая отсутствие аргумента),
+`2` — неизвестный режим.
+
+Переменные окружения: `PREFIX`, `JOBS`, `OFFLINE`, `NO_COLOR`.
+
+---
+
+## 4. Что исправлено в скрипте
+
+Исходный скрипт — копия из LibXenon (`Free60Project/libxenon`).
+Найденные и исправленные дефекты:
+
+| Дефект | Исправление |
+|---|---|
+| Пути считались от текущего каталога, архивы искались не в `dist/` | Все пути от `$SCRIPT_DIR`; `dist/`, `patches/`, `logs/`, `build/`, `src/` |
+| Отсутствие аргумента давало Usage и **код 0** | код 1 для отсутствующего аргумента, код 2 для неизвестного |
+| VMX128-патч пропускался молча из-за несовпадения имени | патч обязателен; отсутствие = ошибка |
+| `2>&1 >> $LOGFILE` — stderr уходил в терминал и терялся из лога | `>> $LOGFILE 2>&1` |
+| `cat file \| patch` без проверки кода pipe | `patch ... < file` |
+| Нет проверки зависимостей | `check_build_deps` с указанием пакета для MSYS2/Fedora/Debian |
+| Ошибки ядра не влияли на код возврата | `set -Eeuo pipefail` + `trap ... ERR` |
+| `[ "$X" != "0" ] && cmd` обрывал скрипт из-за `set -e` | заменено на `if` |
+| `cube()`: перепутана проверка git (при УСТАНОВЛЕННОМ git выводилось «git не нужен») | логика исправлена |
+| Нет контроля целостности исходников | SHA-512 сверен с upstream, проверяется при каждом запуске |
+| `--with-gmp=/opt/local` (путь macOS) передавался всегда | флаги GMP/MPFR убраны, autoconf находит их сам |
+| Опечатка `-enable-interwork` (одно тире) | исправлено |
+| `chown` вызывался безусловно | только под root в Linux |
+
+### Про VMX128
+
+VMX128 в binutils 2.32 отсутствует — проверено по исходникам:
+в `opcodes/ppc-opc.c` нет ни одной мнемоники `v*128`.
+
+Патч `binutils-2.28-vmx128.diff` написан для 2.28 и на 2.32 не
+применим по существу:
+
+* в 2.32 ушло `struct powerpc_operand` — порядок полей
+  `{bitm, shift, insert, extract, flags}`, а в 2.28 было
+  `{shift, shift_mask, insert, extract, flags}`;
+* в 2.32 `bfd/elfxx-ppc.c` отсутствует (поглощён `bfd/elf32-ppc.c`);
+* **маска `0x4000000000ull` в 2.32 уже занята — это `PPC_OPCODE_7450`.**
+  Наивное использование того же значения сломало бы распознавание для 7450.
+
+Создан `patches/binutils-2.32-vmx128.diff` (374 строки), в котором:
+
+* `PPC_OPCODE_VMX_128` = `0x400000000000ull` — первый свободный бит;
+* добавлена запись `vmx128` в `ppc_opts[]` (`opcodes/ppc-dis.c`) — оттуда
+  берутся и `-mvmx128` для gas, и для objdump, через общий `ppc_parse_cpu()`;
+* добавлена строка справки `-mvmx128` в `gas/config/tc-ppc.c`;
+* в `opcodes/ppc-opc.c` перенесены функции `insert/extract_vds128`,
+  `va128`, `vb128`, `vperm` (типы `uint64_t`/`int64_t` как в 2.32),
+  определения операндов `VD128/VA128/VB128/VC128/VPERM128/VD3D*`,
+  макросы форм `VX128*` и **88 инструкций**;
+* `lvlx/stvlx/lvrx/stvrx/lvlxl/stvlxl/lvrxl/stvrxl` получили вариант
+  `CELL|PPCVEC128`.
+
+Проверено: `patch -p1` применяет его к чистому дереву binutils-2.32
+**без смещений и fuzz**, после чего в дереве 88 инструкций `PPCVEC128`,
+одна маска и одна опция.
+
+Скрипт проверяет это перед сборкой и **прерывает её**, если:
+нет маски; маска совпадает с `PPC_OPCODE_7450`; не зарегистрирована
+опция `vmx128`; инструкций меньше 50; нет какой-либо из восьми функций.
+
+### Про GCC и VMX128
+
+**GCC не умеет генерировать VMX128.** `patches/gcc-9.2.0.diff` содержит
+только `config.sub`, отключение `TARGET_ALTIVEC` в `altivec.md` и одну
+правку `libstdc++-v3/configure`. Ни одного расширения VMX128 там нет.
+
+Следствие: патч binutils даёт ассемблер, принимающий VMX128, — это нужно
+для ассемблерного кода и для будущего GCC с VMX128. Автоматически
+компилятор VMX128 не выдаст.
+
+Ни один исходник PSP360 сейчас VMX128 не использует (проверено поиском
+мнемоник `*128` по всем `.cpp/.hpp/.h/.S/.c/.asm`).
+
+---
+
+## 5. Почему сборка заблокирована
+
+Сборка binutils дошла до `libiberty` и упала:
+
+```
+libiberty/pex-unix.c:256: error: implicit declaration of function 'wait'
+libiberty/pex-unix.c:382: error: 'F_GETFD' undeclared
+libiberty/pex-unix.c:795: error: implicit declaration of function 'pipe'
+```
+
+Причина — у хостового компилятора нет POSIX. Проверено:
+
+| Подсистема MSYS2 | C-компилятор | POSIX-заголовки |
+|---|---|---|
+| `msys` | **отсутствует** | **отсутствуют** (`/usr/include/unistd.h`, `/usr/include/sys/wait.h` нет) |
+| `mingw64` | gcc 15.1.0 | рантайм нативный Windows: нет `fork`, `wait`, `pipe`, `fcntl` |
+
+Прочее окружение:
+
+* Docker — нет; Podman — нет; WSL — **не установлен**; Hyper-V — нет;
+* Cygwin — не установлен;
+* готовый Xenon-тулчейн на дисках C: и D: — **не найден**
+  (`/c/msys64/usr/local/xenon` существует, но пуст, 0 байт;
+  `/d/devkitpro` содержит только AArch64 для Switch).
+
+Сборка кросс-тулчейна для ELF/PowerPC требует POSIX-хост. Нужен один из
+вариантов: Linux (Docker/WSL/VM), Cygwin с gcc, либо MSYS2 с POSIX-компилятором.
+
+Скрипт сам добавляет `/mingw64/bin` в `PATH`, если находит gcc там, и
+сообщает об этом, — но это не устраняет несовместимость.
+
+Что при этом **удалось проверить**: `configure` для цели `xenon`
+проходит успешно, `config.sub` после патча знает `xenon`,
+цель разрешается в `powerpc64--linux-gnu`.
+
+---
+
+## 6. Целевая архитектура: `cell` против `750`
+
+Расхождение было между `--with-cpu=cell` в конфигурации тулчейна,
+`-mcpu=cell` в сборке библиотек и `-mcpu=750` в `xbox360/build_xex.ps1`.
+
+Проверено по `opcodes/ppc-dis.c` (таблица `ppc_opts[]`) в binutils 2.32:
+
+```
+cell = PPC_OPCODE_PPC | PPC_OPCODE_64 | PPC_OPCODE_POWER4
+     | PPC_OPCODE_CELL | PPC_OPCODE_ALTIVEC
+750  = PPC_OPCODE_750            (маска 0x2000000000)
+```
+
+* `PPC_OPCODE_CELL` (0x800000) **не входит** в 750.
+* Именно за `PPC_OPCODE_CELL` закреплены 128-битные load/store из патча
+  VMX128: `lvlx128`, `lvrx128`, `stvlx128`, `stvrx128`, `lvlxl128`,
+  `lvrxl128`, `stvlxl128`, `stvrxl128`.
+* За `PPC_OPCODE_750` закреплены всего четыре инструкции:
+  `tsr.`, `tsuspend.`, `tresume.` (HTM) и `efdcmpeq` (EFS).
+* Отдельной опции `-m750` в gas **нет** — есть `750cl`, `gekko`,
+  `broadway`. Прежнее значение было бы отвергнуто ассемблером.
+
+**Решение:** единый набор флагов — `-mcpu=cell -mpowerpc64 -m32`,
+`-mvmx128` добавляется только явным ключом `-UseVmx128`.
+Внесено в `xbox360/build_xex.ps1`.
+
+`-mpowerpc64` обязателен: тулчейн собирается с `--with-cpu=cell` и этим
+же ABI собрана libxenon. `-m32` выбирает 32-битный мультилиб.
+
+---
+
+## 7. Проверки скрипта
+
+Файл проверок: `toolchain/tests/test_script.sh`. Запуск:
+
+```bash
+bash toolchain/tests/test_script.sh
+```
+
+Покрыто: синтаксис; поведение без аргумента; с неизвестным аргументом;
+запуск из четырёх разных рабочих каталогов (включая каталог с пробелом
+в имени); отсутствие обязательного патча; отсутствие архива в
+офлайн-режиме; сверка контрольных сумм.
+
+Результат последнего прогона: **11 успешно, 0 неудачно**.
+
+---
+
+## 8. Контрольные суммы исходников
+
+Сверены с официальными перечнями sourceware (SHA-512):
+
+| Файл | Источник |
+|---|---|
+| binutils-2.32.tar.gz | `sourceware.org/pub/binutils/releases/sha512.sum` |
+| gcc-9.2.0.tar.gz | `sourceware.org/pub/gcc/releases/gcc-9.2.0/sha512.sum` |
+| newlib-3.1.0.tar.gz | `sourceware.org/pub/newlib/sha512.sum` |
+
+Все три локальных файла совпали с upstream. Значения продублированы в
+`dist/CHECKSUMS.sha512` и встроены в скрипт, который проверяет их при
+каждом запуске.
+
+Это выявило ошибку в ходе работы: первоначально в скрипт были внесены
+значения по памяти, и проверка их отвергла. Значения исправлены на
+фактически проверенные.

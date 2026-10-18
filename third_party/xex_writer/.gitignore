@@ -1,4 +1,11 @@
 *.o
 *.exe
+*.obj
+*.pdb
+*.ilk
 /build/
 CMakeFiles/
+
+# Артефакты, которые тест сбрасывает для внешней проверки структуры
+test_in.elf
+test_out.xex

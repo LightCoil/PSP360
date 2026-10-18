@@ -1,195 +1,240 @@
+// xex_writer.cpp - формирование контейнера XEX2 для Xbox 360.
+//
+// Спецификация: XEX Header - ровно 24 байта, big-endian
+// (Free60, System Software / Formats / XEX):
+//
+//   0x00  4  ascii        "XEX2"
+//   0x04  4  module flags (битовое поле)
+//   0x08  4  uint32       PE data offset
+//   0x0C  4  uint32       reserved
+//   0x10  4  uint32       security info offset
+//   0x14  4  uint32       optional header count
+//
+// Далее идут Optional Headers, каждый из двух uint32:
+//   Header ID, Header Data.
+// Размер данных определяется младшим байтом ID:
+//   (ID & 0xFF) == 0x01  -> Header Data СОДЕРЖИТ данные (инлайн);
+//   (ID & 0xFF) == 0xFF  -> данные содержат свой размер в первом DWORD;
+//   иначе                -> Header Data это размер в DWORD'ах.
+//
+// ВАЖНО: перечисленные выше ключи взяты из документации Free60.
+// Идентификаторы, использовавшиеся в прежней версии этого файла
+// (0x2FF, 0x300, 0x400, 0x800, 0xC00), не соответствуют спецификации:
+//   0x2FF   -> Resource Info, а не Entry Point
+//   0x300   -> не определён
+//   0x400   -> не определён (таблицы секций в XEX2 нет)
+//   0x800   -> не определён
+//   0xC00   -> не определён
+// Подробности и тесты: tests/test_xex.cpp.
+
 #include "xex_writer.hpp"
-#include <cstring>
-#include <map>
-#include <vector>
-#include <cstdint>
-#include <string>
+
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 
 namespace xexlib {
 
-// XEX Optional Header Keys
-static constexpr uint32_t XEX_HEADER_ENTRY_POINT      = 0x000002FF;
-static constexpr uint32_t XEX_HEADER_IMAGE_BASE       = 0x00000300;
-static constexpr uint32_t XEX_HEADER_SECTION_TABLE    = 0x00000400;
-static constexpr uint32_t XEX_HEADER_IMPORT_LIBRARIES = 0x00000800;
-static constexpr uint32_t XEX_HEADER_EXPORT_LIBRARIES = 0x00000C00;
+// --- ключи Optional Headers (Free60, System Software / Formats / XEX) ------
+constexpr uint32_t XEX_OPT_ENTRY_POINT       = 0x00010100u;  // &0xFF = 0x00 -> размер в DWORD
+constexpr uint32_t XEX_OPT_IMAGE_BASE        = 0x00010201u;  // &0xFF = 0x01 -> инлайн
+constexpr uint32_t XEX_OPT_ORIGINAL_BASE      = 0x00010001u;
+constexpr uint32_t XEX_OPT_IMPORT_LIBRARIES  = 0x000103FFu;  // &0xFF = 0xFF -> свой размер
+constexpr uint32_t XEX_OPT_STATIC_LIBRARIES  = 0x000200FFu;
+constexpr uint32_t XEX_OPT_BASE_FILE_FORMAT   = 0x000003FFu;
 
-// Section flags
-static constexpr uint32_t XEX_SECTION_CODE = 0x20;
-static constexpr uint32_t XEX_SECTION_DATA = 0x40;
-static constexpr uint32_t XEX_SECTION_BSS  = 0x80;
+// Размер фиксированного заголовка XEX2.
+constexpr size_t XEX_HEADER_SIZE = 24;
 
-// Write 32-bit big-endian
-static void write_u32(std::vector<uint8_t>& out, uint32_t v) {
-    out.push_back((v >> 24) & 0xFF);
-    out.push_back((v >> 16) & 0xFF);
-    out.push_back((v >> 8) & 0xFF);
-    out.push_back(v & 0xFF);
+namespace {
+
+void put_u8(std::vector<uint8_t>& v, uint8_t b) { v.push_back(b); }
+
+void put_u32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
 }
 
-// Overwrite 32-bit BE at position
-static void patch_u32(std::vector<uint8_t>& out, size_t pos, uint32_t v) {
-    if (pos + 4 > out.size()) return;
-    out[pos]     = (v >> 24) & 0xFF;
-    out[pos + 1] = (v >> 16) & 0xFF;
-    out[pos + 2] = (v >> 8) & 0xFF;
-    out[pos + 3] = v & 0xFF;
+uint32_t get_u32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
 
-// Align to `align` boundary (power of two)
-static void write_padding(std::vector<uint8_t>& out, size_t align) {
-    if (align == 0) return;
-    size_t pad = (align - (out.size() % align)) % align;
-    if (pad) out.insert(out.end(), pad, 0);
-}
-
-// Convert ASCII to UTF-16LE
-static void write_utf16le(std::vector<uint8_t>& out, const std::string& s) {
+void put_utf16le(std::vector<uint8_t>& v, const std::string& s) {
     for (unsigned char c : s) {
-        out.push_back(c);
-        out.push_back(0);
+        v.push_back(c);
+        v.push_back(0);
     }
-    out.push_back(0); out.push_back(0);
+    v.push_back(0);   // завершающий NUL
+    v.push_back(0);
 }
 
-// Align offset up to align
-static uint32_t align_up(uint32_t val, uint32_t align) {
-    return (val + align - 1) & ~(align - 1);
+size_t align_up(size_t v, size_t a) {
+    if (a == 0) return v;
+    return (v + a - 1) & ~(a - 1);
 }
 
-// Read 32-bit BE from buffer
-static uint32_t read_u32(const uint8_t* buf) {
-    return (uint32_t(buf[0]) << 24) | (uint32_t(buf[1]) << 16) |
-           (uint32_t(buf[2]) << 8)  | uint32_t(buf[3]);
-}
+// Модульные флаги XEX2 (Free60).
+// bit 7 = User Mode - для обычной пользовательской программы.
+constexpr uint32_t XEX_MODULE_FLAG_USER_MODE = 0x00000080u;
 
-// Extract .text, .data, .bss and entry_point from ELF32 BE with shstrtab
-static bool extract_elf_sections(const std::vector<uint8_t>& elf,
-                                 std::vector<uint8_t>& text,
-                                 std::vector<uint8_t>& data,
-                                 std::vector<uint8_t>& bss,
-                                 uint32_t& entry_point,
-                                 std::string& error) {
-    if (elf.size() < 0x34 || std::memcmp(elf.data(), "\x7FELF", 4) != 0) {
-        error = "Invalid or too small ELF";
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Разбор ELF32 big-endian (PowerPC) - минимально достаточный:
+// нужны entry point и содержимое загружаемых секций.
+// ---------------------------------------------------------------------------
+bool elf_extract(const std::vector<uint8_t>& elf,
+                 std::vector<uint8_t>& payload,
+                 uint32_t& entry_point,
+                 std::string& error) {
+    if (elf.size() < 52 || std::memcmp(elf.data(), "\x7F" "ELF", 4) != 0) {
+        error = "не ELF или слишком мал";
         return false;
     }
-    const uint8_t* hdr = elf.data();
-    if (hdr[4] != 1 || hdr[5] != 2) {
-        error = "Unsupported ELF (need 32-bit BE)";
+    if (elf[4] != 1) { error = "ожидается ELF32 (EI_CLASS=1)"; return false; }
+    if (elf[5] != 2) { error = "ожидается big-endian (EI_DATA=2)"; return false; }
+
+    entry_point = get_u32(&elf[0x18]);
+
+    const uint32_t shoff = get_u32(&elf[0x20]);
+    const uint16_t shentsize = static_cast<uint16_t>((elf[0x2E] << 8) | elf[0x2F]);
+    const uint16_t shnum = static_cast<uint16_t>((elf[0x30] << 8) | elf[0x31]);
+    const uint16_t shstrndx = static_cast<uint16_t>((elf[0x32] << 8) | elf[0x33]);
+
+    if (shentsize < 40) { error = "некорректный размер записи секции"; return false; }
+    if (static_cast<uint64_t>(shoff) +
+            static_cast<uint64_t>(shentsize) * shnum > elf.size()) {
+        error = "заголовки секций за пределами файла";
         return false;
     }
-    entry_point = read_u32(hdr + 0x18);
-    uint32_t shoff   = read_u32(hdr + 0x20);
-    uint16_t shentsz = (hdr[0x2E] << 8) | hdr[0x2F];
-    uint16_t shnum   = (hdr[0x30] << 8) | hdr[0x31];
-    uint16_t shstrndx= (hdr[0x32] << 8) | hdr[0x33];
-    if (uint64_t(shoff) + uint64_t(shentsz)*shnum > elf.size()) {
-        error = "Section headers out of bounds";
-        return false;
-    }
-    // Locate shstrtab
-    const uint8_t* shstrtab = nullptr;
-    uint32_t shstrsz = 0;
+
+    const uint8_t* shstr = nullptr;
+    uint32_t shstr_size = 0;
     if (shstrndx < shnum) {
-        const uint8_t* sh = elf.data() + shoff + shstrndx*shentsz;
-        uint32_t off = read_u32(sh + 0x10);
-        shstrsz = read_u32(sh + 0x14);
-        if (off + shstrsz <= elf.size()) shstrtab = elf.data() + off;
+        const uint8_t* sh = &elf[shoff + static_cast<size_t>(shstrndx) * shentsize];
+        const uint32_t off = get_u32(sh + 0x10);
+        const uint32_t sz  = get_u32(sh + 0x14);
+        if (static_cast<uint64_t>(off) + sz <= elf.size()) {
+            shstr = &elf[off];
+            shstr_size = sz;
+        }
     }
-    // Iterate sections
+
+    payload.clear();
     for (uint16_t i = 0; i < shnum; ++i) {
-        const uint8_t* sh = elf.data() + shoff + i*shentsz;
-        uint32_t nameoff = read_u32(sh + 0x00);
-        uint32_t type    = read_u32(sh + 0x04);
-        uint32_t flags   = read_u32(sh + 0x08);
-        uint32_t off     = read_u32(sh + 0x10);
-        uint32_t sz      = read_u32(sh + 0x14);
-        if (off + sz > elf.size()) continue;
-        std::string secname;
-        if (shstrtab && nameoff < shstrsz) secname = std::string((const char*)(shstrtab + nameoff));
-        if (type == 1 && secname == ".text")
-            text.insert(text.end(), elf.begin()+off, elf.begin()+off+sz);
-        else if (type == 1 && secname == ".data")
-            data.insert(data.end(), elf.begin()+off, elf.begin()+off+sz);
-        else if (type == 8 && secname == ".bss")
-            bss.resize(bss.size() + sz, 0);
+        const uint8_t* sh = &elf[shoff + static_cast<size_t>(i) * shentsize];
+        const uint32_t name_off = get_u32(sh + 0x00);
+        const uint32_t type     = get_u32(sh + 0x04);
+        const uint32_t off      = get_u32(sh + 0x10);
+        const uint32_t sz       = get_u32(sh + 0x14);
+        if (type != 1 /* SHT_PROGBITS */) continue;   // .bss не несёт данных
+        if (static_cast<uint64_t>(off) + sz > elf.size()) continue;
+        std::string name;
+        if (shstr && name_off < shstr_size) {
+            name.assign(reinterpret_cast<const char*>(shstr + name_off));
+        }
+        if (name == ".text" || name == ".data" || name == ".rodata") {
+            payload.insert(payload.end(), elf.begin() + off, elf.begin() + off + sz);
+        }
     }
-    if (text.empty()) { error = "Missing .text"; return false; }
+    if (payload.empty()) { error = "не найдено ни одной загружаемой секции"; return false; }
     return true;
 }
 
 bool write_xex_from_elf(const std::vector<uint8_t>& elf,
-                        const std::map<std::string,std::vector<std::string>>& importLibs,
-                        const std::map<std::string,std::vector<std::string>>& exportLibs,
+                        const std::map<std::string, std::vector<std::string>>& importLibs,
+                        const std::map<std::string, std::vector<std::string>>& exportLibs,
                         std::vector<uint8_t>& xex_out,
                         std::string& error) {
-    std::vector<uint8_t> text, data, bss;
+    std::vector<uint8_t> payload;
     uint32_t entry = 0;
-    if (!extract_elf_sections(elf, text, data, bss, entry, error)) return false;
-    if (entry == 0) { error = "Invalid entry point"; return false; }
+    if (!elf_extract(elf, payload, entry, error)) return false;
+    if (entry == 0) { error = "нулевая точка входа"; return false; }
 
-    using OptPair = std::pair<uint32_t,std::vector<uint8_t>>;
-    std::vector<OptPair> opts;
-    // ENTRY_POINT
-    { std::vector<uint8_t> buf; write_u32(buf, entry); opts.emplace_back(XEX_HEADER_ENTRY_POINT, std::move(buf)); }
-    // IMAGE_BASE
-    { std::vector<uint8_t> buf; write_u32(buf, 0x82000000); opts.emplace_back(XEX_HEADER_IMAGE_BASE, std::move(buf)); }
-    // SECTION_TABLE
-    {
-        std::vector<uint8_t> buf;
-        uint32_t cnt = 1 + (!data.empty()) + (!bss.empty()); write_u32(buf, cnt);
-        uint32_t off = align_up(static_cast<uint32_t>(0 /* header end placeholder*/), 0x1000);
-        // .text
-        write_u32(buf, off); write_u32(buf, text.size()); write_u32(buf, XEX_SECTION_CODE);
-        off = align_up(off + static_cast<uint32_t>(text.size()), 0x1000);
-        // .data
-        if (!data.empty()) { write_u32(buf, off); write_u32(buf, data.size()); write_u32(buf, XEX_SECTION_DATA);
-            off = align_up(off + static_cast<uint32_t>(data.size()), 0x1000);
+    // ---- данные Optional Headers -----------------------------------------
+    // Кодирование размера зависит от младшего байта ID (см. спецификацию):
+    //   (ID & 0xFF) == 0x00 -> поле Header Data есть размер блока в DWORD'ах,
+    //                         сами данные идут следом;
+    //   (ID & 0xFF) == 0x01 -> поле Header Data САМО является данными,
+    //                         дополнительных байт нет;
+    //   (ID & 0xFF) == 0xFF -> поле Header Data есть размер блока в байтах,
+    //                         блок начинается со своего размера (DWORD).
+    struct OptEntry { uint32_t id; uint32_t data_field; std::vector<uint8_t> body; };
+    std::vector<OptEntry> opts;
+
+    // Entry Point (0x10100): класс 0x00, блок = одно DWORD.
+    { OptEntry e{XEX_OPT_ENTRY_POINT, 1, {}};
+      put_u32(e.body, entry);
+      opts.push_back(std::move(e)); }
+
+    // Image Base (0x10201): класс 0x01 -> значение прямо в поле Header Data.
+    { OptEntry e{XEX_OPT_IMAGE_BASE, 0x82000000u, {}};
+      opts.push_back(std::move(e)); }
+
+    // Блок класса 0xFF: сам содержит свой размер первым DWORD.
+    // Вызывающий передаёт содержимое БЕЗ этого размера.
+    auto add_self_sized = [&](uint32_t id, const std::vector<uint8_t>& inner) {
+        OptEntry e;
+        e.id = id;
+        put_u32(e.body, static_cast<uint32_t>(inner.size()));   // размер внутри
+        e.body.insert(e.body.end(), inner.begin(), inner.end());
+        while ((e.body.size() % 4) != 0) e.body.push_back(0);   // выравнивание
+        e.data_field = static_cast<uint32_t>(e.body.size());     // размер снаружи
+        opts.push_back(std::move(e));
+    };
+
+    // Base File Format (0x3FF): класс 0xFF.
+    { std::vector<uint8_t> inner;
+      put_utf16le(inner, "xex");
+      add_self_sized(XEX_OPT_BASE_FILE_FORMAT, inner); }
+
+    auto libs_blob = [](const std::map<std::string, std::vector<std::string>>& libs) {
+        std::vector<uint8_t> d;
+        for (const auto& kv : libs) {
+            std::string upper = kv.first;
+            std::transform(upper.begin(), upper.end(), upper.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            put_utf16le(d, upper);
+            put_u32(d, static_cast<uint32_t>(kv.second.size()));
+            for (const auto& fn : kv.second) put_utf16le(d, fn);
         }
-        // .bss
-        if (!bss.empty()) { write_u32(buf, off); write_u32(buf, bss.size()); write_u32(buf, XEX_SECTION_BSS);
-            off = align_up(off + static_cast<uint32_t>(bss.size()), 0x1000);
-        }
-        opts.emplace_back(XEX_HEADER_SECTION_TABLE, std::move(buf));
+        return d;
+    };
+
+    if (!importLibs.empty()) add_self_sized(XEX_OPT_IMPORT_LIBRARIES, libs_blob(importLibs));
+    if (!exportLibs.empty()) add_self_sized(XEX_OPT_STATIC_LIBRARIES, libs_blob(exportLibs));
+
+    // ---- тело файла: заголовок + optional headers + полезная нагрузка ---
+    // PE data offset: нагрузка начинается с выровненной границы после
+    // заголовка и optional headers. Это поле обязано указывать на неё.
+    const size_t pe_offset = align_up(XEX_HEADER_SIZE, 0x200);
+
+    std::vector<uint8_t> out;
+    out.reserve(pe_offset + payload.size());
+    put_u32(out, 0x58455832u);                 // 0x00 "XEX2"
+    put_u32(out, XEX_MODULE_FLAG_USER_MODE);    // 0x04 module flags
+    put_u32(out, static_cast<uint32_t>(pe_offset)); // 0x08 PE data offset
+    put_u32(out, 0);                            // 0x0C reserved
+    put_u32(out, 0);                            // 0x10 security info offset
+    put_u32(out, static_cast<uint32_t>(opts.size())); // 0x14 count
+
+    for (const OptEntry& o : opts) {
+        put_u32(out, o.id);
+        put_u32(out, o.data_field);
+        out.insert(out.end(), o.body.begin(), o.body.end());
     }
-    // IMPORT_LIBRARIES
-    {
-        std::vector<uint8_t> buf; write_u32(buf, importLibs.size());
-        for (auto& [lib, funcs] : importLibs) {
-            std::string upper = lib;
-            std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-            write_utf16le(buf, upper);
-            write_u32(buf, funcs.size());
-            for (auto& fn : funcs) write_utf16le(buf, fn);
-        }
-        opts.emplace_back(XEX_HEADER_IMPORT_LIBRARIES, std::move(buf));
+
+    if (out.size() > pe_offset) {
+        error = "optional headers не помещаются до границы PE data";
+        return false;
     }
-    // EXPORT_LIBRARIES
-    {
-        std::vector<uint8_t> buf; write_u32(buf, exportLibs.size());
-        for (auto& [lib, funcs] : exportLibs) {
-            std::string upper = lib;
-            std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-            write_utf16le(buf, upper);
-            write_u32(buf, funcs.size());
-            for (auto& fn : funcs) write_utf16le(buf, fn);
-        }
-        opts.emplace_back(XEX_HEADER_EXPORT_LIBRARIES, std::move(buf));
-    }
-    // Build header
-    xex_out.clear(); write_u32(xex_out, 0x58455832); write_u32(xex_out, 2);
-    size_t hdrpos = xex_out.size(); write_u32(xex_out, 0); write_u32(xex_out, 0);
-    write_u32(xex_out, opts.size());
-    for (auto& [key,val] : opts) { write_u32(xex_out, key); write_u32(xex_out, val.size()); xex_out.insert(xex_out.end(), val.begin(), val.end()); }
-    write_u32(xex_out, 0);
-    patch_u32(xex_out, hdrpos, static_cast<uint32_t>(xex_out.size()));
-    // Append sections aligned
-    write_padding(xex_out, 0x1000); xex_out.insert(xex_out.end(), text.begin(), text.end());
-    write_padding(xex_out, 0x1000); xex_out.insert(xex_out.end(), data.begin(), data.end());
-    write_padding(xex_out, 0x1000); xex_out.insert(xex_out.end(), bss.begin(), bss.end());
-    write_padding(xex_out, 0x1000);
+    out.resize(pe_offset, 0);
+    out.insert(out.end(), payload.begin(), payload.end());
+
+    xex_out.swap(out);
     return true;
 }
 

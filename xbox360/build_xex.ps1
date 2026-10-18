@@ -6,7 +6,14 @@
 param(
     [string]$ToolchainRoot = "",
     [string]$LibxenonRoot  = "",
-    [string]$Config        = "Release"
+    [string]$Config        = "Release",
+    # Включить расширение VMX128 (-mvmx128). По умолчанию выключено:
+    # на момент написания ни один исходник PSP360 VMX128 не использует.
+    [switch]$UseVmx128,
+    # Путь к инструменту упаковки ELF -> XEX. У LibXenon такого toolchain-
+    # инструмента нет: цепочка ELF -> NXE (PE) -> XEX выполняется утилитой
+    # xextool. Путь задаётся явно, иначе шаг упаковки честно пропускается.
+    [string]$ElfToXex = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,7 +47,7 @@ $GXX = Join-Path $ToolchainRoot 'bin\powerpc-eabi-g++.exe'
 $AS  = Join-Path $ToolchainRoot 'bin\powerpc-eabi-as.exe'
 $LD  = Join-Path $ToolchainRoot 'bin\powerpc-eabi-ld.exe'
 $OBJCOPY = Join-Path $ToolchainRoot 'bin\powerpc-eabi-objcopy.exe'
-$ELF2XEX = Join-Path $ToolchainRoot 'bin\xenon-elf-to-xex.exe'
+$ELF2XEX = if ($ElfToXex) { $ElfToXex } else { "" }
 
 Write-Host "Тулчейн: $ToolchainRoot" -ForegroundColor Cyan
 
@@ -72,26 +79,62 @@ if ($sources.Count -eq 0) { Write-Error "Исходники не найдены"
 Write-Host "Найдено исходников: $($sources.Count)" -ForegroundColor Cyan
 
 # ---- флаги компиляции ----------------------------------------------------
-# Xenon: PowerPC 750 с расширением VMX128, 32-бит, без ОС
+# Целевая архитектура - Xenon (Gekko), 32-битный PowerPC с ABI powerpc64.
+#
+# Почему -mcpu=cell, а не -mcpu=750 (проверено по binutils 2.32,
+# opcodes/ppc-dis.c, таблица ppc_opts[]):
+#   cell = PPC_OPCODE_PPC | _64 | _POWER4 | _CELL | _ALTIVEC
+#   750  = PPC_OPCODE_750 (Gekko/Broadway: tsr./tsuspend./tresume., efdcmpeq)
+# Маска PPC_OPCODE_CELL НЕ входит в 750. Именно за ней закреплены
+# 128-битные варианты load/store из патча VMX128:
+#   lvlx128, lvrx128, stvlx128, stvrx128, lvlxl128, stvrxl128, lvrxl128, stvrxl128
+# Без -mcpu=cell ассемблер их не распознает.
+# Отдельно: опции -m750 в gas не существует (есть 750cl/gekko/broadway),
+# то есть прежнее значение было бы отвергнуто ассемблером.
+#
+# -mpowerpc64 обязателен: тулчейн собирается с этим ABI (--with-cpu=cell),
+# и libxenon собран под ним же. Без флага ABI не совпадёт.
+# -m32 выбирает 32-битный мультилиб (Xenon - 32-битная система).
 $CFLAGS = @(
-    '-mcpu=750', '-m32', '-O2',
+    '-mcpu=cell', '-mpowerpc64', '-m32', '-O2',
     '-ffreestanding', '-fno-builtin', '-nostdlib',
     '-fno-exceptions', '-fno-rtti',
     "-I$ProjectRoot"
 )
+# VMX128 включается только явным флагом: -mvmx128 есть в собранном
+# binutils (patches/binutils-2.32-vmx128.diff).
+if ($UseVmx128) {
+    $CFLAGS += '-mvmx128'
+    Write-Host "  включён -mvmx128" -ForegroundColor DarkGray
+}
 if ($IncDir) { $CFLAGS += "-I$IncDir" }
+
+# ---- проверка наличия инструментов ---------------------------------------
+foreach ($tool in @(
+    @{ Path = $GXX; Name = 'powerpc-eabi-g++' },
+    @{ Path = $AS;  Name = 'powerpc-eabi-as'  },
+    @{ Path = $LD;  Name = 'powerpc-eabi-ld'  })) {
+    if (-not (Test-Path $tool.Path)) {
+        Write-Host "ОТСУТСТВУЕТ: $($tool.Name) ($($tool.Path))" -ForegroundColor Red
+        exit 1
+    }
+}
 
 $objs = @()
 $failed = 0
 
 foreach ($src in $sources) {
     $obj = Join-Path $OutDir ($src.BaseName + '.o')
-    $args = @($GXX) + $CFLAGS + @('-c', $src.FullName, '-o', $obj)
+    # ВАЖНО: не используем имя $args - это автоматическая переменная
+    # PowerShell; присваивание в неё ломает поведение.
+    $cmdArgs = @($GXX) + $CFLAGS + @('-c', $src.FullName, '-o', $obj)
     Write-Host "  $($src.Name)" -ForegroundColor DarkGray
-    & $args 2>&1 | Where-Object { $_ -match 'error|warning' } | ForEach-Object {
+    $compileOut = & $cmdArgs 2>&1
+    $rc = $LASTEXITCODE
+    $compileOut | Where-Object { $_ -match 'error|warning' } | ForEach-Object {
         Write-Host "    $_" -ForegroundColor Yellow
     }
-    if ($LASTEXITCODE -ne 0) {
+    if ($rc -ne 0) {
         Write-Host "    ОШИБКА компиляции" -ForegroundColor Red
         $failed++
     } else {
@@ -115,9 +158,25 @@ if ($LibDir) {
     Write-Host "Линковка..." -ForegroundColor Cyan
     & $LD @($objs) @LDFLAGS -o $elf
     if ($LASTEXITCODE -eq 0 -and (Test-Path $elf)) {
-        $xex = Join-Path $OutDir 'psp360.xex'
-        & $ELF2XEX $elf $xex
-        Write-Host "XEX собран: $xex" -ForegroundColor Green
+        Write-Host "ELF собран: $elf" -ForegroundColor Green
+        # Упаковка в XEX. Инструмент не входит в тулчейн LibXenon, поэтому
+        # без явного -ElfToXex шаг пропускается явно, а не молча.
+        if ($ELF2XEX -and (Test-Path $ELF2XEX)) {
+            $xex = Join-Path $OutDir 'psp360.xex'
+            & $ELF2XEX $elf $xex
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $xex)) {
+                Write-Host "XEX собран: $xex" -ForegroundColor Green
+            } else {
+                Write-Host "Упаковка в XEX не удалась" -ForegroundColor Red
+                exit 4
+            }
+        } else {
+            Write-Host "Шаг ELF -> XEX пропущен." -ForegroundColor Yellow
+            Write-Host "  В тулчейне LibXenon нет инструмента xenon-elf-to-xex." -ForegroundColor Yellow
+            Write-Host "  Реальная цепочка: ELF -> NXE (PE) -> XEX (утилита xextool)." -ForegroundColor Yellow
+            Write-Host "  Укажите его: -ElfToXex <путь к xextool.exe>" -ForegroundColor Yellow
+            Write-Host "  Переименованный в .xex ELF не является рабочим XEX." -ForegroundColor DarkYellow
+        }
     } else {
         Write-Host "Линковка не удалась" -ForegroundColor Red
         exit 3

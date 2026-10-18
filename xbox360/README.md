@@ -53,9 +53,39 @@ powershell -ExecutionPolicy Bypass -File .\xbox360\build_xex.ps1
 
 Скрипт собирает:
 
-1. `psp360_core` — ядро эмуляции под `-mcpu=750 -m32` (Xenon PowerPC, VMX128)
-2. `psp360_xex` — исполняемый файл, линкуется с `-lxenon -lxenon_xenos -lxenon_input -lxenon_sound`
-3. ELF → XEX конвертацией `xenon-elf-to-xex`
+1. `psp360_core` — ядро эмуляции под `-mcpu=cell -mpowerpc64 -m32`
+   (Xenon PowerPC). Флаг `-mcpu=750`, стоявший здесь раньше, был неверен:
+   маска `PPC_OPCODE_CELL`, за которой закреплены 128-битные load/store
+   VMX128, **не входит** в 750, а самой опции `-m750` в gas нет
+   (есть `750cl`/`gekko`/`broadway`). Подробности — в
+   `../docs/TOOLCHAIN_STATE.md`, раздел 6.
+2. `psp360_xex` — исполняемый файл, линкуется с
+   `-lxenon -lxenon_xenos -lxenon_input -lxenon_sound`
+3. ELF → XEX — **отдельным явным шагом**.
+
+### Про упаковку в XEX
+
+Инструмента `xenon-elf-to-xex` в тулчейне LibXenon **нет**. Реальная
+цепочка: ELF → NXE (PE-образ) → XEX, причём последний шаг выполняет
+утилита `xextool`. Поэтому:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\xbox360\build_xex.ps1 `
+    -ElfToXex "D:\xbox 360\xextool.exe"
+```
+
+Без `-ElfToXex` скрипт соберёт ELF и **явно** сообщит, что шаг упаковки
+пропущен. Переименованный в `.xex` ELF рабочим XEX не является.
+
+Ключи:
+
+| Ключ | Назначение |
+|---|---|
+| `-ToolchainRoot` | префикс тулчейна (иначе ищется через `DEVKITXENON`) |
+| `-LibxenonRoot` | каталог libxenon |
+| `-Config` | `Release` (по умолчанию) или `Debug` |
+| `-UseVmx128` | добавить `-mvmx128`. По умолчанию выключено: ни один исходник PSP360 VMX128 не использует |
+| `-ElfToXex` | путь к инструменту упаковки |
 
 ## Что ещё потребуется для реального XEX
 
