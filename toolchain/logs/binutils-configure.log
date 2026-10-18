@@ -1,0 +1,107 @@
+configure: loading site script /etc/config.site
+checking build system type... x86_64-w64-mingw32
+checking host system type... x86_64-w64-mingw32
+checking target system type... powerpc64--linux-gnu
+checking for a BSD-compatible install... /usr/bin/install -c
+checking whether ln works... yes
+checking whether ln -s works... no, using cp -pR
+checking for a sed that does not truncate output... /usr/bin/sed
+checking for gawk... gawk
+checking for gcc... gcc
+checking whether the C compiler works... yes
+checking for C compiler default output file name... a.exe
+checking for suffix of executables... .exe
+checking whether we are cross compiling... no
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether gcc accepts -g... yes
+checking for gcc option to accept ISO C89... none needed
+checking for g++... g++
+checking whether we are using the GNU C++ compiler... yes
+checking whether g++ accepts -g... yes
+checking whether g++ accepts -static-libstdc++ -static-libgcc... yes
+checking for gnatbind... no
+checking for gnatmake... no
+checking whether compiler driver understands Ada... no
+checking how to compare bootstrapped objects... cmp --ignore-initial=16 $$f1 $$f2
+checking for objdir... .libs
+checking for isl 0.15 or later... yes
+checking for default BUILD_CONFIG... 
+checking for --enable-vtable-verify... no
+checking for bison... bison -y
+checking for bison... bison
+checking for gm4... no
+checking for gnum4... no
+checking for m4... m4
+checking for flex... flex
+checking for flex... flex
+checking for makeinfo... makeinfo
+checking for expect... no
+checking for runtest... no
+checking for ar... ar
+checking for as... as
+checking for dlltool... dlltool
+checking for ld... (cached) C:/msys64/mingw64/bin/../lib/gcc/x86_64-w64-mingw32/15.1.0/../../../../x86_64-w64-mingw32/bin/ld.exe
+checking for lipo... no
+checking for nm... nm
+checking for ranlib... ranlib
+checking for strip... strip
+checking for windres... windres
+checking for windmc... windmc
+checking for objcopy... objcopy
+checking for objdump... objdump
+checking for readelf... readelf
+checking for xenon-cc... no
+checking for xenon-gcc... no
+checking for xenon-c++... no
+checking for xenon-g++... no
+checking for xenon-cxx... no
+checking for xenon-gxx... no
+checking for xenon-gcc... no
+checking for xenon-gfortran... no
+checking for xenon-gccgo... no
+checking for xenon-ar... no
+checking for xenon-as... no
+checking for xenon-dlltool... no
+checking for xenon-ld... no
+checking for xenon-lipo... no
+checking for xenon-nm... no
+checking for xenon-objcopy... no
+checking for xenon-objdump... no
+checking for xenon-ranlib... no
+checking for xenon-readelf... no
+checking for xenon-strip... no
+checking for xenon-windres... no
+checking for xenon-windmc... no
+checking where to find the target ar... just compiled
+checking where to find the target as... just compiled
+checking where to find the target cc... pre-installed
+checking where to find the target c++... pre-installed
+checking where to find the target c++ for libstdc++... pre-installed
+checking where to find the target dlltool... just compiled
+checking where to find the target gcc... pre-installed
+checking where to find the target gfortran... pre-installed
+checking where to find the target gccgo... pre-installed
+checking where to find the target ld... just compiled
+checking where to find the target lipo... pre-installed
+checking where to find the target nm... just compiled
+checking where to find the target objcopy... just compiled
+checking where to find the target objdump... just compiled
+checking where to find the target ranlib... just compiled
+checking where to find the target readelf... just compiled
+checking where to find the target strip... just compiled
+checking where to find the target windres... just compiled
+checking where to find the target windmc... just compiled
+checking whether to enable maintainer-specific portions of Makefiles... no
+configure: creating ./config.status
+config.status: creating Makefile
+make[1]: Entering directory '/h/tools/New XeX Era/libxenon-master/toolchain/build'
+mkdir -p -- ./libiberty
+Configuring in ./libiberty
+mkdir -p -- ./intl
+Configuring in ./intl
+mkdir -p -- ./bfd
+Configuring in ./bfd
+make[2]: Entering directory '/h/tools/New XeX Era/libxenon-master/toolchain/build/libiberty'
+make[2]: Leaving directory '/h/tools/New XeX Era/libxenon-master/toolchain/build/libiberty'
+make[1]: Leaving directory '/h/tools/New XeX Era/libxenon-master/toolchain/build'
