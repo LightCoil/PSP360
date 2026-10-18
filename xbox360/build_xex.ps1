@@ -20,6 +20,24 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
 
 # ---- поиск тулчейна ------------------------------------------------------
+# Имена инструментов зависят от того, как config.sub канонизировал цель:
+# при --target=xenon          -> xenon-as.exe, xenon-gcc.exe
+# при --target=powerpc-eabi   -> powerpc-eabi-as.exe, powerpc-eabi-gcc.exe
+# Поэтому префикс определяется по фактически установленным файлам, а не
+# предполагается. Проверяются оба порядка.
+$ToolchainPrefixes = @('xenon-', 'powerpc-eabi-', '')
+
+function Find-Toolchain([string]$root) {
+    if (-not $root) { return $null }
+    foreach ($p in $ToolchainPrefixes) {
+        $as = Join-Path $root "bin\$p${as}.exe"
+        if (Test-Path $as) {
+            return [pscustomobject]@{ Root = $root; Prefix = $p }
+        }
+    }
+    return $null
+}
+
 if (-not $ToolchainRoot) {
     $candidates = @(
         $env:DEVKITXENON,
@@ -29,27 +47,48 @@ if (-not $ToolchainRoot) {
         "$ProjectRoot\libxenon-master\toolchain"
     )
     foreach ($c in $candidates) {
-        if ($c -and (Test-Path (Join-Path $c 'bin\powerpc-eabi-g++.exe'))) {
-            $ToolchainRoot = $c; break
+        if (-not $c) { continue }
+        if (-not (Test-Path $c)) { continue }
+        $found = Find-Toolchain $c
+        if ($found) {
+            $ToolchainRoot = $found.Root
+            $ToolchainPrefix = $found.Prefix
+            break
         }
     }
 }
 
 if (-not $ToolchainRoot) {
     Write-Host "ТУЛЧЕЙН НЕ НАЙДЕН" -ForegroundColor Red
-    Write-Host "Установите devkitXenon или укажите -ToolchainRoot." -ForegroundColor Yellow
+    Write-Host "Ищем ассемблер с префиксами: $($ToolchainPrefixes -join ', ')" -ForegroundColor Yellow
+    Write-Host "Укажите префикс вручную: -ToolchainRoot <путь>" -ForegroundColor Yellow
     Write-Host "Подробности: $PSScriptRoot\README.md" -ForegroundColor Yellow
     exit 1
 }
 
-$GCC = Join-Path $ToolchainRoot 'bin\powerpc-eabi-gcc.exe'
-$GXX = Join-Path $ToolchainRoot 'bin\powerpc-eabi-g++.exe'
-$AS  = Join-Path $ToolchainRoot 'bin\powerpc-eabi-as.exe'
-$LD  = Join-Path $ToolchainRoot 'bin\powerpc-eabi-ld.exe'
-$OBJCOPY = Join-Path $ToolchainRoot 'bin\powerpc-eabi-objcopy.exe'
+# Если путь задан пользователем, префикс всё равно вычисляем.
+if (-not $ToolchainPrefix) {
+    $found = Find-Toolchain $ToolchainRoot
+    if (-not $found) {
+        Write-Host "В $ToolchainRoot\bin нет ассемблера с известным префиксом" -ForegroundColor Red
+        Get-ChildItem (Join-Path $ToolchainRoot 'bin') -ErrorAction SilentlyContinue |
+            Select-Object -First 10 -ExpandProperty Name | ForEach-Object { Write-Host "    $_" }
+        exit 1
+    }
+    $ToolchainPrefix = $found.Prefix
+}
+
+$ToolBin = Join-Path $ToolchainRoot 'bin'
+function Tool([string]$name) { return (Join-Path $ToolBin "$ToolchainPrefix$name.exe") }
+
+$GCC  = Tool 'gcc'
+$GXX  = Tool 'g++'
+$AS   = Tool 'as'
+$LD   = Tool 'ld'
+$OBJCOPY = Tool 'objcopy'
 $ELF2XEX = if ($ElfToXex) { $ElfToXex } else { "" }
 
-Write-Host "Тулчейн: $ToolchainRoot" -ForegroundColor Cyan
+Write-Host "Тулчейн: $ToolchainRoot (префикс '$ToolchainPrefix')" -ForegroundColor Cyan
 
 # ---- определение каталогов libxenon --------------------------------------
 $libPaths = @()
@@ -111,9 +150,9 @@ if ($IncDir) { $CFLAGS += "-I$IncDir" }
 
 # ---- проверка наличия инструментов ---------------------------------------
 foreach ($tool in @(
-    @{ Path = $GXX; Name = 'powerpc-eabi-g++' },
-    @{ Path = $AS;  Name = 'powerpc-eabi-as'  },
-    @{ Path = $LD;  Name = 'powerpc-eabi-ld'  })) {
+    @{ Path = $GXX; Name = "${ToolchainPrefix}g++" },
+    @{ Path = $AS;  Name = "${ToolchainPrefix}as"  },
+    @{ Path = $LD;  Name = "${ToolchainPrefix}ld"  })) {
     if (-not (Test-Path $tool.Path)) {
         Write-Host "ОТСУТСТВУЕТ: $($tool.Name) ($($tool.Path))" -ForegroundColor Red
         exit 1

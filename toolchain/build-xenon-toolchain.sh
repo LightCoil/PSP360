@@ -202,6 +202,34 @@ check_build_deps() {
             missing=1
         fi
     done
+
+    # GCC требует ЗАГОЛОВКИ gmp.h/mpfr.h/mpc.h. Одних библиотек
+    # времени выполнения недостаточно: без них configure обрывается
+    # сообщением "Building GCC requires GMP 4.2+, MPFR 2.4.0+ and
+    # MPC 0.8.0+".
+    local h
+    for h in gmp.h mpfr.h mpc.h; do
+        if [ ! -f "/usr/include/$h" ] && [ ! -f "/usr/local/include/$h" ]; then
+            err "Отсутствует заголовок $h - GCC без него не соберётся"
+            err "  MSYS2:      pacman -S --needed gmp-devel mpfr-devel mpc-devel"
+            err "  Fedora:     sudo dnf install gmp-devel mpfr-devel libmpc-devel"
+            err "  Debian/Ub.: sudo apt install libgmp-dev libmpfr-dev libmpc-dev"
+            missing=1
+        fi
+    done
+
+    # GCC 9.2 требует isl >= 0.15 для графитовых оптимизаций. Без
+    # заголовков configure обрывается на "required isl version is
+    # 0.15 or later". Альтернатива - флаг --without-isl, но тогда
+    # отключается graphite, поэтому ставим пакет с заголовками.
+    if [ ! -f "/usr/include/isl/ctx.h" ]; then
+        err "Отсутствуют заголовки isl (/usr/include/isl/ctx.h) - GCC 9.2 не соберётся"
+        err "  MSYS2:      pacman -S --needed isl-devel"
+        err "  Fedora:     sudo dnf install isl-devel"
+        err "  Debian/Ub.: sudo apt install libisl-dev"
+        err "  Либо передайте GCC --without-isl (отключит graphite)."
+        missing=1
+    fi
     if [ "$missing" -ne 0 ]; then
         err ""
         err "Установите перечисленные компоненты и повторите сборку."
@@ -294,14 +322,37 @@ require_patch() {
     ok "Патч найден: patches/$name ($(wc -c <"$p") байт)"
 }
 
-# apply_patch <путь-к-каталогу-источника> <имя патча> <strip>
+# apply_patch <каталог-источника> <имя патча> <файл-маркер> <строка-маркер>
+#
+# Идемпотентна: если маркер уже присутствует, патч считается применённым
+# и повторно не наносится. Это нужно, потому что src/ переиспользуется
+# между запусками: повторное нанесение дало бы «Reversed (or previously
+# applied) patch detected» и ошибочно оборвало бы сборку.
 apply_patch() {
-    local srcdir="$1" name="$2" strip="${3:-p1}"
+    local srcdir="$1" name="$2" marker_file="$3" marker_str="$4"
     local p="$PATCH_DIR/$name"
+
+    if [ -f "$srcdir/$marker_file" ] &&
+       grep -q -- "$marker_str" "$srcdir/$marker_file"; then
+        ok "Патч $name уже применён (маркер найден в $marker_file)"
+        return 0
+    fi
+
     info "Применение патча $name"
-    ( cd "$srcdir" && patch "-$strip" --batch --forward < "$p" ) \
+    ( cd "$srcdir" && patch "-${PATCH_STRIP:-p1}" --batch --forward < "$p" ) \
         >>"$LOGFILE" 2>&1 \
         || fail "Патч $name не применился к $srcdir (см. $LOGFILE)"
+
+    # patch может оставить .rej при частичном применении - это ошибка
+    if find "$srcdir" -name '*.rej' -newer "$p" 2>/dev/null | grep -q .; then
+        err "Патч $name применился частично - найдены файлы .rej:"
+        find "$srcdir" -name '*.rej' | head -5 | sed 's/^/    /' >&2
+        fail "Устраните конфликт вручную и повторите"
+    fi
+
+    if ! grep -q -- "$marker_str" "$srcdir/$marker_file" 2>/dev/null; then
+        fail "После нанесения $name маркер '$marker_str' не найден в $marker_file"
+    fi
     ok "Патч $name применён"
 }
 
@@ -439,8 +490,8 @@ toolchain_install() {
         info "Дерево $BINUTILS уже распаковано (используется повторно)"
     fi
 
-    apply_patch "$SRC" "$PATCH_BINUTILS_BASE" p1
-    apply_patch "$SRC" "$PATCH_BINUTILS_VMX128" p1
+    apply_patch "$SRC" "$PATCH_BINUTILS_BASE"    "config.sub"            'xenon)'
+    apply_patch "$SRC" "$PATCH_BINUTILS_VMX128"   "include/opcode/ppc.h" 'PPC_OPCODE_VMX_128'
     verify_vmx128 "$SRC"
 
     local BD="$BUILD_DIR/binutils"
@@ -459,9 +510,11 @@ toolchain_install() {
     ( cd "$BD" && make install ) >>"$LOGFILE" 2>&1 \
         || fail "Установка binutils не удалась"
 
-    local AS="$PREFIX/bin/powerpc-eabi-as"
-    [ -x "$AS" ] || fail "Ассемблер не найден после установки: $AS"
-    ok "Ассемблер собран: $($AS --version 2>&1 | head -1)"
+    detect_tool_prefix
+    local AS="$PREFIX/bin/${TOOL_PREFIX}as"
+    [ -f "$AS" ] || AS="$AS.exe"
+    [ -f "$AS" ] || fail "Ассемблер не найден после установки в $PREFIX/bin"
+    ok "Ассемблер собран: $("$AS" --version 2>&1 | head -1)"
 
     # --- gcc (первый проход) --------------------------------------------
     local GSRC="$WORK_DIR/$GCC"
@@ -472,7 +525,7 @@ toolchain_install() {
             || fail "Распаковка $GCC не удалась"
         mv "$GSRC.tmp/$GCC" "$GSRC"; rmdir "$GSRC.tmp"
     fi
-    apply_patch "$GSRC" "$PATCH_GCC" p1
+    apply_patch "$GSRC" "$PATCH_GCC"    "config.sub" 'xenon)'
 
     local GBD="$BUILD_DIR/gcc1"
     say "configure gcc (проход 1: только C, без заголовков)"
@@ -500,7 +553,7 @@ toolchain_install() {
             || fail "Распаковка $NEWLIB не удалась"
         mv "$NSRC.tmp/$NEWLIB" "$NSRC"; rmdir "$NSRC.tmp"
     fi
-    apply_patch "$NSRC" "$PATCH_NEWLIB" p1
+    apply_patch "$NSRC" "$PATCH_NEWLIB" "config.sub" 'xenon)'
 
     local NBD="$BUILD_DIR/newlib"
     say "Сборка newlib"
@@ -535,9 +588,10 @@ toolchain_install() {
     ( cd "$GBD" && make install ) >>"$LOGFILE" 2>&1 \
         || fail "Установка gcc (2) не удалась"
 
-    local GCCBIN="$PREFIX/bin/powerpc-eabi-gcc"
-    [ -x "$GCCBIN" ] || fail "Компилятор не найден после установки: $GCCBIN"
-    ok "Компилятор собран: $($GCCBIN --version 2>&1 | head -1)"
+    local GCCBIN="$PREFIX/bin/${TOOL_PREFIX}gcc"
+    [ -f "$GCCBIN" ] || GCCBIN="$GCCBIN.exe"
+    [ -f "$GCCBIN" ] || fail "Компилятор не найден после установки в $PREFIX/bin"
+    ok "Компилятор собран: $("$GCCBIN" --version 2>&1 | head -1)"
 
     verify_toolchain
     all_done
@@ -549,12 +603,13 @@ toolchain_install() {
 verify_toolchain() {
     say "Проверка собранного тулчейна"
     local t
-    for t in powerpc-eabi-as powerpc-eabi-ld powerpc-eabi-gcc; do
-        local f="$PREFIX/bin/$t"
-        if [ ! -x "$f" ]; then
-            fail "Нет $f"
+    for t in as ld gcc; do
+        local f="$PREFIX/bin/${TOOL_PREFIX}${t}"
+        [ -f "$f" ] || f="$f.exe"
+        if [ ! -f "$f" ]; then
+            fail "Нет ${TOOL_PREFIX}${t} в $PREFIX/bin"
         fi
-        info "$t: $("$f" --version 2>&1 | head -1)"
+        info "${TOOL_PREFIX}${t}: $("$f" --version 2>&1 | head -1)"
     done
 
     # Реальная проверка: ассемблер обязан собрать объект целевой архитектуры
@@ -569,15 +624,51 @@ _start:
 	mtctr 3
 	bctr
 EOF
-    if "$PREFIX/bin/powerpc-eabi-as" -mregnames -o "$TD/t.o" "$TD/t.s" \
+    if "$PREFIX/bin/${TOOL_PREFIX}as" -mregnames -a32 -o "$TD/t.o" "$TD/t.s" \
             >>"$LOGFILE" 2>&1; then
-        ok "Ассемблер собрал объект для целевой архитектуры"
+        ok "Ассемблер собрал 32-битный объект целевой архитектуры"
     else
-        fail "Ассемблер не смог собрать контрольный объект"
+        fail "Ассемблер не смог собрать контрольный объект (см. $LOGFILE)"
     fi
-    if command -v od >/dev/null 2>&1; then
-        info "Первые байты объекта: $(od -An -tx1 -N16 "$TD/t.o")"
+
+    # Формат объекта проверяем целевым readelf, а не «на глаз».
+    local RE="$PREFIX/bin/${TOOL_PREFIX}readelf"
+    [ -f "$RE" ] || RE="$RE.exe"
+    if [ -f "$RE" ] && [ -f "$TD/t.o" ]; then
+        local hdr; hdr="$("$RE" -h "$TD/t.o" 2>/dev/null)"
+        if printf '%s' "$hdr" | grep -q ELF32; then ok "объект ELF32"
+        else fail "объект не ELF32"; fi
+        if printf '%s' "$hdr" | grep -q 'big endian'; then ok "порядок байтов big endian"
+        else fail "порядок байтов не big endian"; fi
     fi
+
+    # Линкер обязан создать настоящий исполняемый файл целевой архитектуры.
+    if "$PREFIX/bin/${TOOL_PREFIX}ld" -Ttext=0x82000000 -e _start \
+           --oformat elf32-powerpc -o "$TD/t.elf" "$TD/t.o" \
+           >>"$LOGFILE" 2>&1 && [ -f "$TD/t.elf" ]; then
+        ok "Линкер создал исполнимый ELF: $TD/t.elf"
+    else
+        fail "Линкер не смог создать исполнимый ELF (см. $LOGFILE)"
+    fi
+}
+
+# Определение префикса имён инструментов по фактически установленным файлам.
+# При --target=xenon получаются xenon-as/xenon-gcc/..., при
+# --target=powerpc-eabi - powerpc-eabi-as/... Догадываться нельзя:
+# config.sub канонизирует цель по-своему, и имя может отличаться.
+detect_tool_prefix() {
+    local cand exe
+    for cand in "powerpc-eabi-" "xenon-" ""; do
+        for exe in as ld; do
+            if [ -x "$PREFIX/bin/${cand}${exe}" ] || [ -x "$PREFIX/bin/${cand}${exe}.exe" ]; then
+                TOOL_PREFIX="$cand"
+                return 0
+            fi
+        done
+    done
+    err "Не найден ни один ассемблер в $PREFIX/bin"
+    ls "$PREFIX/bin" 2>/dev/null | head -10 | sed 's/^/    /' >&2
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -726,6 +817,22 @@ all_done() {
 # Диспетчер аргументов
 # ---------------------------------------------------------------------------
 MODE="${1:-}"
+
+# Защита от параллельного запуска. Две одновременные сборки делят один
+# каталог build/ и портят друг другу результат: configure начинает
+# видеть "conftest.c: No such file or directory", потому что вторая
+# сборка удаляет файлы первой. Это наблюдалось фактически.
+acquire_lock() {
+    local lockdir="$TOOLCHAIN_DIR/.build.lock.d"
+    if ! mkdir "$lockdir" 2>/dev/null; then
+        err "Другая сборка, по-видимому, уже идёт (замок: $lockdir)"
+        err "Если процесс упал и не убрал замок, удалите каталог вручную."
+        exit 1
+    fi
+    printf '%s\n' "$$" > "$lockdir/pid"
+    trap 'rmdir "$lockdir" 2>/dev/null || true' EXIT
+}
+acquire_lock
 if [ $# -gt 0 ]; then shift; fi
 
 case "$MODE" in
